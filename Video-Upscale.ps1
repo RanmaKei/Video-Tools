@@ -1,121 +1,191 @@
-﻿# ============================================================
-# Interactive Upscale Script (Smart Resume)
-#  - Input: Cropped videos (e.g. 640x360)
-#  - Output: 1080p FFV1 (lossless) + FLAC in MKV
-#
-# Features:
-#  * GPU selection + GPU-tagged work/output dirs (gpu0/gpu1)
-#  * Resume: keeps extracted frames; and if upscale is incomplete,
-#    it ONLY upscales the missing frames (no 17-hour restart)
-#  * Optional keep temp dirs (NoDelete)
-#  * Output validation before cleanup
-# ============================================================
-
-<#
+﻿<#
 .SYNOPSIS
-Interactive video upscaler pipeline using Upscayl + ffmpeg with smart resume and GPU tagging.
+Batch upscales videos using Upscayl + FFmpeg with GPU tagging and “smart resume”.
 
 .DESCRIPTION
-This script batch-processes source videos (default folder: "source") by:
+This script processes videos in a source folder (default: "source") using a frame-based pipeline:
 
-1) Extracting frames with ffmpeg
-2) Upscaling frames with Upscayl (Real-ESRGAN model)
-3) Rebuilding a final video using ffmpeg with audio copied from the original source
+  1) Extract frames with FFmpeg
+  2) Upscale frames with Upscayl (Real-ESRGAN)
+  3) Rebuild the final video with FFmpeg (audio preserved/copied)
 
-It supports:
-- GPU selection (manual or auto) and GPU-tagged work/output folders to avoid job collisions
-- Smart resume: keeps extracted frames and only upscales missing frames if an upscale run was interrupted
-- Optional temp cleanup control (NoDelete)
-- Output validation before cleanup
-- Dry-run resume check (detect incomplete jobs without doing any work)
-- Output presets (codec/container/target resolution choices)
+Key features:
+- GPU selection (-GpuIndex) with GPU-tagged work/output folders to avoid collisions (gpu0/gpu1/gpuAuto)
+- Smart resume (-Resume): keeps extracted frames and only upscales missing frames after an interruption
+- Dry-run project scan (-DryRun): reports incomplete jobs without doing any work
+- Output presets (-OutputPreset): choose container/codecs + target resolution (1080p/4K) or match source
+- Optional tool auto-download (-AutoDownloadTools): fetches FFmpeg/FFprobe and Upscayl from GitHub releases
+- Output validation before cleanup; -NoDelete keeps temp dirs for troubleshooting/rebuilds
+- Basic “GPU busy/locked” safety prompts before starting heavy work
 
 .PARAMETER InputDir
-Source folder containing input videos. Default is "source".
-Example: -InputDir "source-640x360"
+Folder containing input videos. Default: "source".
+Relative paths are resolved against the current directory.
+Examples:
+  -InputDir "source-640x360"
+  -InputDir ".\captures"
 
 .PARAMETER OutputPreset
-Controls final output format (container + codecs + target resolution).
-Common presets:
-- ffv1_1080p_mkv  : Lossless FFV1 video + FLAC audio in MKV (master)
-- ffv1_4k_mkv     : Lossless FFV1 video + FLAC audio in MKV (master, 4K)
-- h264_1080p_mp4  : H.264 video + AAC audio in MP4 (delivery)
-- hevc_1080p_mp4  : H.265/HEVC video + AAC audio in MP4 (delivery, smaller)
-- prores_1080p_mov: ProRes 422 HQ + PCM audio in MOV (editing)
+Final output format (container + codecs + target resolution). Default: av1_1080p_mkv.
 
-Default: ffv1_1080p_mkv
+Presets currently supported by this script:
+  Lossless / archival:
+    - ffv1_1080p_mkv  : FFV1 + FLAC in MKV (lossless master)
+    - ffv1_4k_mkv     : FFV1 + FLAC in MKV (lossless master, 4K)
+    - prores_1080p_mov: ProRes 422 HQ + PCM in MOV (editing)
+    - prores_4k_mov   : ProRes 422 HQ + PCM in MOV (editing, 4K)
 
-.PARAMETER GpuIndex
-Upscayl GPU index to use. If omitted, the script can auto-select a discrete GPU
-and warn if the chosen GPU is busy/locked.
+  Delivery:
+    - h264_1080p_mp4  : H.264 + AAC in MP4
+    - h264_4k_mp4     : H.264 + AAC in MP4 (4K)
+    - hevc_1080p_mp4  : H.265/HEVC + AAC in MP4
+    - hevc_4k_mp4     : H.265/HEVC + AAC in MP4 (4K)
+    - av1_1080p_mkv   : AV1 (SVT-AV1) + Opus in MKV (best size)
+    - av1_1080p_mp4   : AV1 (SVT-AV1) + AAC in MP4 (compatibility)
+    - av1_4k_mkv      : AV1 (SVT-AV1) + Opus in MKV (4K)
+    - av1_4k_mp4      : AV1 (SVT-AV1) + AAC in MP4 (4K)
 
-.PARAMETER Resume
-Resume mode:
-- If extracted frames already exist, skip extraction.
-- If upscaled frames are incomplete, only upscale missing frames (smart resume).
+Notes:
+- If -OutputPreset is NOT explicitly provided, the script will inspect the first input video and
+  display an interactive target menu (1–13) to choose a preset, including a “match source” option.
 
-.PARAMETER NoDelete
-If set, keeps working directories (frames/upscaled) after success.
-If not set, work folders are removed only after a verified output is produced.
+.PARAMETER OutputDir
+Where finished videos are written. Default: auto-generated based on OutputPreset + GPU tag.
+Example output dirs:
+  av1_1080p_gpuAuto, ffv1_4k_gpu1, etc.
 
-.PARAMETER DryRun
-Dry-run resume check only:
-- Detects unfinished projects in work directories and reports progress
-- Does not run extraction/upscale/encode
-
-.PARAMETER Force
-Overwrite output files if they exist. If not specified, output will be skipped
-when a valid output already exists.
+.PARAMETER WorkDir
+Working directory root (frames/upscaled/tmp). Default: "_ffv1_work_<gpuTag>".
+Work dirs are GPU-tagged to prevent collisions when running multiple instances.
 
 .PARAMETER UpscaylPath
-Path to upscayl-bin.exe. Default is ".\upscayl-bin.exe" in the script folder.
+Path to the Upscayl executable.
+- If omitted: the script will try script-folder candidates and PATH.
+- If -AutoDownloadTools is used: Upscayl can be downloaded automatically.
+Examples:
+  -UpscaylPath ".\upscayl-bin.exe"
+  -UpscaylPath "C:\Tools\Upscayl\upscayl-bin.exe"
+
+.PARAMETER AutoDownloadTools
+If set, automatically downloads missing tools into ".\tools\" (relative to current directory):
+- FFmpeg/FFprobe from GyanD/codexffmpeg (asset matching *full_build*.zip)
+- Upscayl from upscayl/upscayl (asset matching *win.zip)
+
+This is only invoked if required tools are missing from PATH / provided paths.
 
 .PARAMETER Model
-Upscayl model name (e.g. realesrgan-x4plus). Default: realesrgan-x4plus
+Upscayl model name. Default: realesrgan-x4plus.
+Valid values (as constrained by ValidateSet in this script):
+  realesrgan-x4plus
+  realesrgan-x4plus-anime
+  remacri
+  ultramix_balanced
+  ultramix_ultrasharp
 
 .PARAMETER Scale
-Upscayl scale factor. Default: 3
+Requested Upscayl scale factor (1–8). Default: 3.
+
+Important behavior:
+- When the selected OutputPreset targets a specific resolution (1080p/4K), the script may
+  auto-adjust the effective scale PER FILE (within 1–4) to avoid generating frames far larger
+  than the target (then downscaling later).
+- When using “match source” mode, the script keeps your chosen -Scale (enhance/sharpen only path).
+
+.PARAMETER GpuIndex
+Upscayl GPU index. Default: -1 (auto).
+- -1: auto-select (script prompts if needed; uses heuristics and can prefer discrete GPUs)
+- 0..32: explicit Upscayl GPU index
+The script can warn if GPUs appear busy or “locked” by existing work folders.
+
+.PARAMETER NoPreferDiscrete
+Disables the script’s preference for discrete GPUs during auto-selection.
+
+.PARAMETER BusyThresholdPercent
+Threshold (0–100) used by the GPU busy check to warn before starting work. Default: 50.
 
 .PARAMETER Extensions
-Comma-separated list of input extensions to process (e.g. "mp4,mov,mkv").
-Default: "mp4"
+Comma-separated list of extensions to scan (no dots required). Default: empty => uses a built-in
+canonical list (mp4,mkv,mov,webm,avi,...).
+Special value:
+  "*" = scan all files and detect video using ffprobe (slower, but catches uncommon extensions)
+
+Examples:
+  -Extensions "mp4,mkv,webm"
+  -Extensions "*"
+
+.PARAMETER Resume
+Enables resume mode:
+- If extracted frames already exist, extraction is skipped.
+- If upscaled frames are incomplete, only missing frames are upscaled.
+- If multiple unfinished projects exist, you’ll be prompted to choose which one to resume.
+- When resuming and -NoDelete is not explicitly specified, the script defaults to keeping temp dirs.
+
+.PARAMETER DryRun
+Scan mode only:
+- Detects unfinished projects (frames vs upscaled frames)
+- Prints completion percentage and intended action
+- Does not extract/upscale/encode and exits
+
+.PARAMETER Force
+Overwrite output files if they already exist. If not set, valid existing outputs are skipped.
+
+.PARAMETER NoDelete
+Keep working directories after completion (frames/upscaled/normalized/etc).
+Recommended for debugging, verification, or when you want to rerun the rebuild step quickly.
+
+.PARAMETER Help
+Show this help text:
+  .\Video-Upscale.ps1 -Help
 
 .EXAMPLE
-# Basic run (default input folder "source", lossless 1080p master)
-.\upscale.ps1
+# Basic run: default input folder "source", default preset (av1_1080p_mkv)
+.\Video-Upscale.ps1
+
+.EXAMPLE
+# Choose a preset interactively (only happens when -OutputPreset is NOT provided)
+.\Video-Upscale.ps1
 
 .EXAMPLE
 # Specify input folder and output preset
-.\upscale.ps1 -InputDir "source-640x360" -OutputPreset ffv1_1080p_mkv
+.\Video-Upscale.ps1 -InputDir "source-640x360" -OutputPreset ffv1_1080p_mkv
 
 .EXAMPLE
-# Run on a specific GPU
-.\upscale.ps1 -GpuIndex 1 -OutputPreset ffv1_1080p_mkv
+# Run on a specific GPU (Upscayl index 1)
+.\Video-Upscale.ps1 -GpuIndex 1 -OutputPreset av1_4k_mp4
 
 .EXAMPLE
-# Resume an interrupted job (only upscale missing frames, keep temp files)
-.\upscale.ps1 -Resume -NoDelete
+# Resume an interrupted job; keep temp work dirs (good for troubleshooting)
+.\Video-Upscale.ps1 -Resume -NoDelete
 
 .EXAMPLE
-# Dry-run: show incomplete project progress without doing work
-.\upscale.ps1 -DryRun
+# Dry-run: report incomplete projects and exit
+.\Video-Upscale.ps1 -DryRun
 
 .EXAMPLE
-# Create a delivery MP4 and overwrite existing output
-.\upscale.ps1 -OutputPreset h264_1080p_mp4 -Force
+# Auto-download missing tools (ffmpeg/ffprobe/upscayl) and run
+.\Video-Upscale.ps1 -AutoDownloadTools
+
+.EXAMPLE
+# Scan all files (ffprobe-detect), then encode a delivery MP4, overwriting existing outputs
+.\Video-Upscale.ps1 -Extensions "*" -OutputPreset h264_1080p_mp4 -Force
 
 .NOTES
-- Requires ffmpeg + ffprobe available in PATH.
-- Upscayl GPU indexing is determined by Upscayl. Use your script’s GPU listing/snapshot
-  output to confirm index mappings.
-- Work directories are GPU-tagged (e.g. _ffv1_work_gpu0) to avoid collisions.
-- Output is validated before any cleanup occurs.
+Tooling:
+- Requires ffmpeg + ffprobe + Upscayl available via PATH or explicit paths, unless -AutoDownloadTools is used.
+- Upscayl GPU indexing is determined by Upscayl. Use the script’s GPU listing/snapshot output to confirm mappings.
+
+Workspace:
+- Work dirs are GPU-tagged (e.g. "_ffv1_work_gpu0") and act as a “lock” indicator for unfinished jobs.
+- Outputs are validated before cleanup; cleanup happens only after a verified output is produced.
+
+Resolution/geometry:
+- The script can normalize upscaled frames to the final target resolution when Upscayl output
+  doesn’t exactly match the target (pad/crop/stretch policy in frame normalization function).
 
 .LINK
-ffmpeg: https://ffmpeg.org/
+FFmpeg: https://ffmpeg.org/
 Upscayl: https://github.com/upscayl/upscayl
 #>
-
 
 [CmdletBinding()]
 param(
