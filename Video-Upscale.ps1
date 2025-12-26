@@ -198,8 +198,16 @@ param(
 
     # Upscayl options
     [Parameter()]
-    [ValidateSet("realesrgan-x4plus","realesrgan-x4plus-anime","remacri","ultramix_balanced","ultramix_ultrasharp")]
-    [string]$Model = "realesrgan-x4plus",
+    [ValidateSet(
+        "digital-art-4x",
+        "high-fidelity-4x",
+        "remacri-4x",
+        "ultramix-balanced-4x",
+        "ultrasharp-4x",
+        "upscayl-lite-4x",
+        "upscayl-standard-4x"
+    )]
+    [string]$Model = "upscayl-standard-4x",
 
     [Parameter()]
     [ValidateRange(1,8)]
@@ -258,12 +266,22 @@ param(
     [switch]$NoPreferDiscrete
 )
 
-$PreferDiscrete = -not $NoPreferDiscrete
+
+# -------------------------
+# Help
+# -------------------------
 
 if ($Help) {
     Get-Help -Detailed $PSCommandPath
     exit 0
 }
+
+# -------------------------
+# Constants / script state
+# -------------------------
+
+$BaseDir = (Get-Location).Path
+$script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # Canonical video extensions (do NOT store this in $Extensions)
 $VideoExtensions = @(
@@ -272,9 +290,43 @@ $VideoExtensions = @(
   "vob","ogv","rm","rmvb","asf","dv","y4m"
 )
 
-if (-not $PSBoundParameters.ContainsKey("DryRun")) {
-    $DryRun = (Read-Host "Dry-run resume check only? (Y/N)").ToUpper() -eq "Y"
+# -------------------------
+# 1. Tiny pure helpers
+# -------------------------
+function Resolve-FullPath {
+    param([Parameter(Mandatory)][string]$Path, [string]$Base = $BaseDir)
+
+    if ([IO.Path]::IsPathRooted($Path)) {
+        return (Resolve-Path $Path -ErrorAction Stop).Path
+    } else {
+        return (Resolve-Path (Join-Path $Base $Path) -ErrorAction Stop).Path
+    }
 }
+function Get-SafeName([string]$Name) {
+  $n = $Name -replace '[\p{Cc}]',''           # drop control chars
+  $n = $n -replace '[<>:"/\\|?*]','_'         # Windows-illegal in paths
+  $n = $n.Trim().TrimEnd('.')                 # avoid trailing dot
+  if ([string]::IsNullOrWhiteSpace($n)) { $n = "video" }
+  return $n
+}
+function Find-FirstFile {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$FileName
+    )
+    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ieq $FileName } |
+        Select-Object -First 1 -ExpandProperty FullName
+}
+function Resolve-ExeOrNull {
+    param([Parameter(Mandatory)][string]$Name)
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    return $null
+}
+# -------------------------
+# 2. Input validation + simple inspection
+# -------------------------
 function Test-IsVideoFile {
     param([Parameter(Mandatory)][string]$Path)
     try {
@@ -284,7 +336,6 @@ function Test-IsVideoFile {
         return $false
     }
 }
-
 function Get-ImageSize {
     [CmdletBinding()]
     param(
@@ -315,7 +366,23 @@ function Get-ImageSize {
         Height = [int]$parts[1]
     }
 }
-
+function Get-PngCount($dir) {
+    if (-not (Test-Path -LiteralPath $dir)) { return 0 }
+    return (Get-ChildItem -LiteralPath $dir -Filter "frame_*.png" -File -ErrorAction SilentlyContinue | Measure-Object).Count
+}
+function Get-Fps($file) {
+    $r = & $script:FfprobeExe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1 "file:$file"
+    $r = $r -replace "r_frame_rate=", ""
+    if (-not $r) { return 30.0 }
+    if ($r -match "/") {
+        $p = $r.Split("/")
+        if ($p.Count -eq 2 -and [double]$p[1] -ne 0) { return [double]$p[0] / [double]$p[1] }
+    }
+    return [double]$r
+}
+# -------------------------
+# 3. Presets / resolution targeting
+# -------------------------
 function Get-TargetWHFromPreset {
     [CmdletBinding()]
     param(
@@ -336,7 +403,170 @@ function Get-TargetWHFromPreset {
 
     return [pscustomobject]@{ W = [int]$parts[0]; H = [int]$parts[1]; Mode = "fixed" }
 }
+function Get-TargetDimsFromPreset {
+    param([Parameter(Mandatory)][pscustomobject]$Preset)
 
+    if ([string]::IsNullOrWhiteSpace($Preset.Scale)) {
+        return $null
+    }
+
+    $p = $Preset.Scale -split ":"
+    if ($p.Count -ne 2) { throw "Preset.Scale must be 'W:H' but was: $($Preset.Scale)" }
+
+    return [pscustomobject]@{
+        W = [int]$p[0]
+        H = [int]$p[1]
+    }
+}
+function Get-UpscaylScaleForTarget {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][int]$SrcW,
+        [Parameter(Mandatory)][int]$SrcH,
+        [Parameter(Mandatory)][int]$TargetW,
+        [Parameter(Mandatory)][int]$TargetH,
+        [Parameter()][int]$MaxScale = 4,
+        [Parameter()][int]$MinScale = 1
+    )
+
+    # ratio needed to reach/beat target in each dimension
+    $rw = $TargetW / [double]$SrcW
+    $rh = $TargetH / [double]$SrcH
+
+    # we want upscayl output >= target in BOTH dimensions (so normalization is only minor)
+    $need = [math]::Ceiling([math]::Max($rw, $rh))
+
+    # clamp to what you allow
+    $need = [math]::Max($MinScale, [math]::Min($MaxScale, $need))
+
+    return [int]$need
+}
+function Get-UpscaleTarget {
+    param(
+        [Parameter(Mandatory)]$SrcInfo
+    )
+
+    # Keep it simple: user chooses a target "profile"
+$choices = @(
+    [pscustomobject]@{ Key="1";  Preset="av1_4k_mkv";       Name="UHD-Modern: 4K AV1 + Opus in MKV (best size)";
+        W=3840; H=2160; Container="mkv"; VCodec="av1";  ACodec="opus"; PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="2";  Preset="av1_4k_mp4";       Name="UHD-Modern: 4K AV1 + AAC in MP4 (best size + compatibility)";
+        W=3840; H=2160; Container="mp4"; VCodec="av1";  ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="3";  Preset="hevc_4k_mp4";      Name="UHD-Standard: 4K HEVC CRF 22 in MP4 (smaller, good quality)";
+        W=3840; H=2160; Container="mp4"; VCodec="hevc"; ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="4";  Preset="h264_4k_mp4";      Name="UHD-Legacy: 4K H.264 CRF 20 in MP4 (bigger, compatible)";
+        W=3840; H=2160; Container="mp4"; VCodec="h264"; ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="5";  Preset="av1_1080p_mkv";    Name="HD-Modern: 1080p AV1 + Opus in MKV (best size)";
+        W=1920; H=1080; Container="mkv"; VCodec="av1";  ACodec="opus"; PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="6";  Preset="av1_1080p_mp4";    Name="HD-Modern: 1080p AV1 + AAC in MP4 (best size + compatibility)";
+        W=1920; H=1080; Container="mp4"; VCodec="av1";  ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="7";  Preset="hevc_1080p_mp4";   Name="HD-Standard: 1080p H.265 CRF 20 in MP4 (smaller file)";
+        W=1920; H=1080; Container="mp4"; VCodec="hevc"; ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="8";  Preset="h264_1080p_mp4";   Name="HD-Legacy: 1080p H.264 CRF 18 in MP4 (high quality)";
+        W=1920; H=1080; Container="mp4"; VCodec="h264"; ACodec="aac";  PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="9";  Preset="prores_4k_mov";    Name="Archival-UHD: 4K ProRes 422 HQ + PCM in MOV (editing)";
+        W=3840; H=2160; Container="mov"; VCodec="prores"; ACodec="pcm"; PixFmt="yuv422p10le" },
+
+    [pscustomobject]@{ Key="10"; Preset="ffv1_4k_mkv";      Name="Archival-UHD: 4K FFV1 + FLAC in MKV (huge lossless master)";
+        W=3840; H=2160; Container="mkv"; VCodec="ffv1";  ACodec="flac"; PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="11"; Preset="prores_1080p_mov"; Name="Archival-HD: 1080p ProRes 422 HQ + PCM in MOV (editing)";
+        W=1920; H=1080; Container="mov"; VCodec="prores"; ACodec="pcm"; PixFmt="yuv422p10le" },
+
+    [pscustomobject]@{ Key="12"; Preset="ffv1_1080p_mkv";   Name="Archival-HD: 1080p FFV1 + FLAC in MKV (lossless master)";
+        W=1920; H=1080; Container="mkv"; VCodec="ffv1";  ACodec="flac"; PixFmt="yuv420p" },
+
+    [pscustomobject]@{ Key="13"; Preset="match_source";     Name="Match source (no resize), just rebuild (FFV1+FLAC MKV)";
+        W=$SrcInfo.Width; H=$SrcInfo.Height; Container="mkv"; VCodec="ffv1"; ACodec="flac"; PixFmt="yuv420p" }
+)
+
+
+
+    Write-Host ""
+    Write-Host "[Target Output Presets]"
+    foreach ($c in $choices) {
+        Write-Host ("  [{0}] {1}" -f $c.Key, $c.Name)
+    }
+
+    $sel  = Read-Host "Select 1-13"
+    $pick = $choices | Where-Object { $_.Key -eq $sel } | Select-Object -First 1
+    if (-not $pick) { throw "Invalid selection: $sel" }
+
+    if ($pick.Preset -eq "match_source") {
+        $preset = [pscustomobject]@{
+            Name      = "match_source"
+            Ext       = "mkv"
+            VCodec    = "ffv1"
+            VArgs     = @("-level","3","-g","1","-pix_fmt","yuv420p")
+            ACodec    = "flac"
+            AArgs     = @()
+            Scale     = $null
+            ExtraMaps = @()
+        }
+    } else {
+        $preset = Get-OutputPresetConfig -PresetName $pick.Preset
+        $preset.Scale = "$($pick.W):$($pick.H)"
+
+        if ($preset.Ext -ne $pick.Container) {
+            Write-Warning "Menu container '$($pick.Container)' != preset extension '$($preset.Ext)'. Using preset '$($preset.Ext)'."
+        }
+    }
+
+    # Return BOTH, so caller can update OutputPreset string + use preset object
+    return [pscustomobject]@{
+        Pick   = $pick
+        Preset = $preset
+    }
+}
+function Get-RelativePathFrom {
+    param(
+        [Parameter(Mandatory)][string]$FromDir,
+        [Parameter(Mandatory)][string]$ToPath
+    )
+    # PowerShell 7+ / .NET: returns a relative path without needing external tools
+    return [System.IO.Path]::GetRelativePath($FromDir, $ToPath)
+}
+function Resolve-UpscaylModelsArg {
+    param(
+        [Parameter(Mandatory)][string]$UpscaylExe,
+        [Parameter(Mandatory)][string]$ModelName
+    )
+
+    $binDir  = Split-Path -Parent $UpscaylExe          # ...\resources\bin
+    $resDir  = Split-Path -Parent $binDir              # ...\resources
+
+    # Search both common roots
+    $searchRoots = @(
+        (Join-Path $binDir "models"),
+        (Join-Path $resDir "models")
+    ) | Where-Object { Test-Path -LiteralPath $_ } | Select-Object -Unique
+
+    foreach ($root in $searchRoots) {
+        # Find the param anywhere under the root
+        $param = Get-ChildItem -LiteralPath $root -Recurse -File -ErrorAction SilentlyContinue |
+                 Where-Object { $_.Name -ieq "$ModelName.param" } |
+                 Select-Object -First 1
+
+        if (-not $param) { continue }
+
+        # Ensure the .bin exists alongside it
+        $bin = Join-Path $param.DirectoryName "$ModelName.bin"
+        if (-not (Test-Path -LiteralPath $bin)) { continue }
+
+        # Return relative path from binDir to the directory that actually contains the model files
+        return (Get-RelativePathFrom -FromDir $binDir -ToPath $param.DirectoryName)
+    }
+
+    throw "Could not locate $ModelName.param/$ModelName.bin under: $($searchRoots -join ', ')"
+}
 function Write-WarningIfNoResolutionGain {
     [CmdletBinding()]
     param(
@@ -378,370 +608,6 @@ function Write-WarningIfNoResolutionGain {
         }
     }
 }
-
-
-function Get-SampleFramePath {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$FramesDir
-    )
-
-    if (-not (Test-Path -LiteralPath $FramesDir)) { return $null }
-
-    # pick the first png/jpg we find (sorted) as a sample
-    $sample = Get-ChildItem -LiteralPath $FramesDir -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Extension -match '^\.(png|jpg|jpeg|webp)$' } |
-        Sort-Object Name |
-        Select-Object -First 1
-
-    return $sample?.FullName
-}
-
-function Test-FramesMatchTarget{
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$FfmpegExe,
-        [Parameter(Mandatory)][string]$FfprobeExe,
-
-        [Parameter(Mandatory)][string]$UpscaledFramesDir,
-
-        [Parameter(Mandatory)][int]$TargetW,
-        [Parameter(Mandatory)][int]$TargetH,
-
-        # Where normalized frames will go IF needed
-        [Parameter(Mandatory)][string]$NormalizedFramesDir,
-
-        # Your frame pattern like frame_%06d.png or similar
-        [Parameter(Mandatory)][string]$FramePattern,
-
-        # If your frames are PNG keep png; if JPG keep jpg
-        [Parameter][ValidateSet("png","jpg")][string]$OutExt = "png",
-
-        # Aspect policy: "Pad" = keep AR, add bars; "Crop" = fill frame; "Stretch" = force
-        [ValidateSet("Pad","Crop","Stretch")]
-        [string]$AspectPolicy = "Pad",
-
-        [switch]$DryRun
-    )
-
-    $sample = Get-SampleFramePath -FramesDir $UpscaledFramesDir
-    if (-not $sample) { throw "No frames found in: $UpscaledFramesDir" }
-
-    $size = Get-ImageSize -FfprobeExe $FfprobeExe -ImagePath $sample
-    Write-Host ("[Frames] Upscayl sample: {0}x{1} (target {2}x{3})" -f $size.Width,$size.Height,$TargetW,$TargetH)
-
-    if ($size.Width -eq $TargetW -and $size.Height -eq $TargetH) {
-        Write-Host "[Frames] Already matches target; skipping normalization."
-        return $UpscaledFramesDir
-    }
-
-    Write-Warning "[Frames] Mismatch: will normalize with ffmpeg to exact target size."
-
-    if ($DryRun) {
-        Write-Host "[DryRun] Would normalize frames to $TargetW x $TargetH into: $NormalizedFramesDir"
-        return $NormalizedFramesDir
-    }
-
-    New-Item -ItemType Directory -Force -Path $NormalizedFramesDir | Out-Null
-
-    # Build vf per policy
-    $vf = switch ($AspectPolicy) {
-        "Pad" {
-            # keep AR, fit inside, pad to exact
-            # setsar=1 keeps square pixels
-            # Pad
-            "scale=w=${TargetW}:h=${TargetH}:force_original_aspect_ratio=decrease,pad=${TargetW}:${TargetH}:(ow-iw)/2:(oh-ih)/2,setsar=1"
-
-        }
-        "Crop" {
-            # keep AR, fill, then crop to exact
-            # Crop
-            "scale=w=${TargetW}:h=${TargetH}:force_original_aspect_ratio=increase,crop=${TargetW}:${TargetH},setsar=1"
-        }
-        "Stretch" {
-            # force exact (may distort)
-            # Stretch
-            "scale=w=${TargetW}:h=${TargetH},setsar=1"
-        }
-    }
-
-    $inPattern  = Join-Path $UpscaledFramesDir $FramePattern
-    $outPattern = Join-Path $NormalizedFramesDir ($FramePattern -replace '\.\w+$', ".$OutExt")
-
-    Write-Host "[Frames] Normalizing with vf: $vf"
-
-    & $FfmpegExe @(
-        "-hide_banner","-loglevel","error",
-        "-y",
-        "-i", $inPattern,
-        "-vf", $vf,
-        # keep lossless-ish for PNG; adjust if you use JPG
-        $outPattern
-    )
-
-    # Validate normalized sample
-    $sample2 = Get-SampleFramePath -FramesDir $NormalizedFramesDir
-    if (-not $sample2) { throw "Normalization produced no frames in: $NormalizedFramesDir" }
-
-    $size2 = Get-ImageSize -FfprobeExe $FfprobeExe -ImagePath $sample2
-    if ($size2.Width -ne $TargetW -or $size2.Height -ne $TargetH) {
-        throw "Normalization failed: got $($size2.Width)x$($size2.Height) expected $TargetW x $TargetH"
-    }
-
-    Write-Host "[Frames] Normalization OK."
-    return $NormalizedFramesDir
-}
-
-
-function Resolve-VideoTools {
-    [CmdletBinding()]
-    param(
-        [string]$FfmpegExe,
-        [string]$FfprobeExe,
-        [string]$UpscaylExe,
-
-        [switch]$AutoDownloadTools,
-
-        [string]$ToolsDir = (Join-Path $PSScriptRoot "tools")
-    )
-
-    function _ResolveOne {
-        param(
-            [Parameter(Mandatory)][string]$Name,
-            [string]$PreferredPath,
-            [string]$CommandName,
-            [string[]]$ScriptDirCandidates = @(),
-            [switch]$WasExplicitlyProvided
-        )
-
-        # 1) If user explicitly provided a path: validate or throw
-        # 1) Explicit path wins (if supplied)
-        if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
-
-            # If relative, make it relative to the script folder (NOT the current working dir)
-            $p = $PreferredPath
-            if (-not [IO.Path]::IsPathRooted($p)) {
-                $p = Join-Path $PSScriptRoot $p
-            }
-
-            if (Test-Path -LiteralPath $p) {
-                return (Resolve-Path -LiteralPath $p).Path
-            }
-
-            # If AutoDownloadTools is enabled, don't hard-fail yet.
-            if ($AutoDownloadTools) { return $null }
-
-            throw "$Name path was provided but not found: $PreferredPath (resolved to '$p')"
-        }
-
-        # 2) Try script-folder candidates (only when not explicitly provided)
-        foreach ($cand in $ScriptDirCandidates) {
-            $p = Join-Path $PSScriptRoot $cand
-            if (Test-Path -LiteralPath $p) {
-                return (Resolve-Path -LiteralPath $p).Path
-            }
-        }
-
-        # 3) Try PATH
-        $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
-        if ($cmd -and $cmd.Source) { return $cmd.Source }
-
-        return $null
-    }
-
-    $resolved = [ordered]@{
-        ffmpeg  = _ResolveOne -Name "ffmpeg"  -PreferredPath $FfmpegExe  -CommandName "ffmpeg"  -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfmpegExe')
-        ffprobe = _ResolveOne -Name "ffprobe" -PreferredPath $FfprobeExe -CommandName "ffprobe" -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfprobeExe')
-        upscayl = _ResolveOne -Name "upscayl" -PreferredPath $UpscaylExe -CommandName "upscayl-bin.exe" `
-                    -ScriptDirCandidates @("upscayl-bin.exe","upscayl.exe","upscayl-bin") `
-                    -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('UpscaylExe')
-    }
-
-    if ($AutoDownloadTools) {
-        foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
-            if (-not $resolved[$k]) {
-                # hook your downloader here
-            }
-        }
-    }
-
-    if ($AutoDownloadTools) {
-        Ensure-VideoToolsDownloaded -ToolsDir $ToolsDir   # <— your download function
-        $resolved = Resolve-VideoTools -FfmpegExe $FfmpegExe -FfprobeExe $FfprobeExe -UpscaylExe $UpscaylExe -AutoDownloadTools:$AutoDownloadTools
-    }
-
-    # Final validation after download attempt
-    foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
-        if (-not $resolved[$k]) {
-            throw "[Tools] Still missing required tool after download attempt: $k"
-        }
-    }
-        $script:Tools = [pscustomobject]@{
-            Ffmpeg  = $resolved.ffmpeg
-            Ffprobe = $resolved.ffprobe
-            Upscayl = $resolved.upscayl
-        }
-
-        return $script:Tools
-    }
-
-
-function Get-InputVideoFiles {
-    param(
-        [Parameter(Mandatory)][string]$InputDir,
-        [string]$Extensions
-    )
-
-    # "*" means: scan all files and detect video by ffprobe
-    if ($Extensions -and $Extensions.Trim() -eq "*") {
-        return Get-ChildItem -Path $InputDir -File -ErrorAction SilentlyContinue |
-            Where-Object { Test-IsVideoFile $_.FullName } |
-            Sort-Object FullName -Unique
-    }
-
-    # extension-only scanning
-    $exts =
-        if ([string]::IsNullOrWhiteSpace($Extensions)) {
-            $VideoExtensions
-        } else {
-            $Extensions.Split(',') |
-                ForEach-Object { $_.Trim().TrimStart('.').ToLowerInvariant() } |
-                Where-Object { $_ }
-        }
-
-    return Get-ChildItem -Path $InputDir -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $ext = $_.Extension.TrimStart('.').ToLowerInvariant()
-            $exts -contains $ext
-        } |
-        Sort-Object FullName -Unique
-}
-
-$BaseDir = (Get-Location).Path
-
-# ---------------------------
-# Tool discovery (PS5.1-safe)
-# Priority: Param path -> Script folder -> PATH
-# ---------------------------
-
-# Script folder (works in PS5.1)
-$script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
-
-function Get-UpscaylScaleForTarget {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][int]$SrcW,
-        [Parameter(Mandatory)][int]$SrcH,
-        [Parameter(Mandatory)][int]$TargetW,
-        [Parameter(Mandatory)][int]$TargetH,
-        [Parameter()][int]$MaxScale = 4,
-        [Parameter()][int]$MinScale = 1
-    )
-
-    # ratio needed to reach/beat target in each dimension
-    $rw = $TargetW / [double]$SrcW
-    $rh = $TargetH / [double]$SrcH
-
-    # we want upscayl output >= target in BOTH dimensions (so normalization is only minor)
-    $need = [math]::Ceiling([math]::Max($rw, $rh))
-
-    # clamp to what you allow
-    $need = [math]::Max($MinScale, [math]::Min($MaxScale, $need))
-
-    return [int]$need
-}
-function Resolve-ExeCandidate {
-    param([Parameter(Mandatory)][string]$Path)
-    try {
-        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
-        if (Test-Path -LiteralPath $Path) { return (Resolve-Path -LiteralPath $Path).Path }
-    } catch { }
-    return $null
-}
-
-function Find-ExeInDir {
-    param(
-        [Parameter(Mandatory)][string]$Dir,
-        [Parameter(Mandatory)][string[]]$Names
-    )
-    foreach ($n in $Names) {
-        $p = Join-Path $Dir $n
-        $r = Resolve-ExeCandidate -Path $p
-        if ($r) { return $r }
-    }
-    return $null
-}
-
-function Resolve-UpscaylExe {
-    [CmdletBinding()]
-    param(
-        [Parameter(Mandatory)][string]$RootDir
-    )
-
-    if (-not (Test-Path -LiteralPath $RootDir)) { return $null }
-
-    # Upscayl zips vary; find anything that looks like the main exe.
-    $candidates = Get-ChildItem -LiteralPath $RootDir -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.Extension -ieq ".exe" -and
-            $_.Name -imatch '^upscayl.*\.exe$' -and
-            $_.Name -inotmatch 'unins|uninstall'
-        }
-
-    if (-not $candidates) { return $null }
-
-    # Prefer your older naming if it exists
-    $preferred = $candidates | Where-Object { $_.Name -ieq "upscayl-bin.exe" } | Select-Object -First 1
-    if ($preferred) { return $preferred.FullName }
-
-    # Otherwise pick the shortest path (usually the real app exe, not buried junk)
-    return ($candidates | Sort-Object @{Expression={ $_.FullName.Length }} | Select-Object -First 1).FullName
-}
-
-function Resolve-ExeFromPath {
-    param([Parameter(Mandatory)][string]$Name)
-    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return $cmd.Source }
-    return $null
-}
-
-
-function Resolve-FullPath {
-    param([Parameter(Mandatory)][string]$Path, [string]$Base = $BaseDir)
-
-    if ([IO.Path]::IsPathRooted($Path)) {
-        return (Resolve-Path $Path -ErrorAction Stop).Path
-    } else {
-        return (Resolve-Path (Join-Path $Base $Path) -ErrorAction Stop).Path
-    }
-}
-
-# ===========================
-# GitHub Release Auto-Download
-# ===========================
-# Requires: PowerShell 7+, Expand-Archive, Internet access
-# Uses:
-#   - https://api.github.com/repos/GyanD/codexffmpeg/releases/latest
-#   - https://api.github.com/repos/upscayl/upscayl/releases/latest
-
-$ToolsRoot = Join-Path $BaseDir "tools"
-New-Item -ItemType Directory -Force $ToolsRoot | Out-Null
-
-function Invoke-GitHubApi {
-    param([Parameter(Mandatory)][string]$Url)
-
-    $headers = @{
-        "User-Agent" = "Video-Upscale-Script"
-        "Accept"     = "application/vnd.github+json"
-    }
-
-    # Optional: if you want to avoid rate limits, set env var GITHUB_TOKEN
-    if ($env:GITHUB_TOKEN) {
-        $headers["Authorization"] = "Bearer $($env:GITHUB_TOKEN)"
-    }
-
-    return Invoke-RestMethod -Uri $Url -Headers $headers -Method Get -ErrorAction Stop
-}
 function Get-PresetPixFmt {
     param([Parameter(Mandatory)]$Preset)
 
@@ -754,512 +620,6 @@ function Get-PresetPixFmt {
     } catch { }
     return "n/a"
 }
-
-function Resolve-ExeOrNull {
-    param([Parameter(Mandatory)][string]$Name)
-    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
-    if ($cmd -and $cmd.Source) { return $cmd.Source }
-    return $null
-}
-function Find-FirstFile {
-    param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$FileName
-    )
-    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ieq $FileName } |
-        Select-Object -First 1 -ExpandProperty FullName
-}
-function Get-GitHubReleaseAsset {
-    param(
-        [Parameter(Mandatory)][string]$Owner,
-        [Parameter(Mandatory)][string]$Repo,
-        [Parameter(Mandatory)][string]$NameRegex,   # e.g. 'full_build\.zip$'
-        [ValidateSet("latest","all")][string]$Mode = "latest"
-    )
-
-    $api =
-        if ($Mode -eq "latest") {
-            "https://api.github.com/repos/$Owner/$Repo/releases/latest"
-        } else {
-            "https://api.github.com/repos/$Owner/$Repo/releases"
-        }
-
-    $rel = Invoke-GitHubApi -Url $api
-
-    # If Mode=all, $rel is an array; pick first release that has a matching asset
-    $releases = @()
-    if ($Mode -eq "all") { $releases = @($rel) } else { $releases = @($rel) }
-
-    foreach ($r in $releases) {
-        $asset = @($r.assets) | Where-Object { $_.name -match $NameRegex } | Select-Object -First 1
-        if ($asset) {
-            return [pscustomobject]@{
-                Tag          = $r.tag_name
-                Name         = $asset.name
-                DownloadUrl  = $asset.browser_download_url
-                SizeBytes    = $asset.size
-                UpdatedAt    = $asset.updated_at
-            }
-        }
-    }
-
-    throw "No asset matching regex '$NameRegex' found for $Owner/$Repo."
-}
-
-function Invoke-DownloadFile {
-    param(
-        [Parameter(Mandatory)][string]$Url,
-        [Parameter(Mandatory)][string]$OutFile
-    )
-    New-Item -ItemType Directory -Force (Split-Path $OutFile -Parent) | Out-Null
-
-    $bits = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
-    if ($bits) {
-        Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
-    } else {
-        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
-    }
-}
-
-function Expand-ZipFresh {
-    param(
-        [Parameter(Mandatory)][string]$ZipPath,
-        [Parameter(Mandatory)][string]$DestDir
-    )
-    if (Test-Path -LiteralPath $DestDir) {
-        Remove-Item -LiteralPath $DestDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Force $DestDir | Out-Null
-    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestDir -Force
-}
-function Get-FromGitHubReleaseZip {
-    param(
-        [Parameter(Mandatory)][string]$Owner,
-        [Parameter(Mandatory)][string]$Repo,
-        [Parameter(Mandatory)][string]$AssetNameRegex,
-        [Parameter(Mandatory)][string]$InstallSubdir,
-        [Parameter(Mandatory)][string]$PrimaryExeName,
-        [string]$SecondaryExeName = ""
-    )
-
-    $installDir = Join-Path $ToolsRoot $InstallSubdir
-    
-    # Already installed?
-    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
-    if ($installedPrimary) {
-        $installedSecondary = $null
-        if ($SecondaryExeName) {
-            $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
-        }
-
-        return [pscustomobject]@{
-            InstallDir   = $installDir
-            PrimaryExe   = $installedPrimary
-            SecondaryExe = $installedSecondary
-            Source       = "cache"
-        }
-    }
-
-    $asset = Get-GitHubReleaseAsset -Owner $Owner -Repo $Repo -NameRegex $AssetNameRegex
-    Write-Host "[Tools] Downloading $Owner/$Repo $($asset.Tag) asset: $($asset.Name)"
-
-    $cacheDir = Join-Path $ToolsRoot "_cache"
-    New-Item -ItemType Directory -Force $cacheDir | Out-Null
-    $zipPath  = Join-Path $cacheDir $asset.Name
-
-    Invoke-DownloadFile -Url $asset.DownloadUrl -OutFile $zipPath
-
-    # Extract to temp then copy the folder that contains the exe(s)
-    $tmp = Join-Path $cacheDir ("extract_{0}_{1}" -f $InstallSubdir, ([guid]::NewGuid().ToString("N")))
-    Expand-ZipFresh -ZipPath $zipPath -DestDir $tmp
-
-    # After Expand-Archive of Upscayl into $upscaylRoot (or whatever your dest folder is)
-    $upscaylPathResolved = Resolve-UpscaylExe -RootDir $upscaylRoot
-
-    if (-not $upscaylPathResolved) {
-        $dump = Get-ChildItem -LiteralPath $upscaylRoot -Recurse -File -ErrorAction SilentlyContinue |
-            Select-Object -First 30 -ExpandProperty FullName
-        throw "Upscayl extracted but no upscayl*.exe found under: $upscaylRoot`nTop files:`n$($dump -join "`n")"
-    }
-
-    $foundPrimary = Find-FirstFile -Root $tmp -FileName $PrimaryExeName
-    if (-not $foundPrimary) {
-        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName inside it."
-    }
-
-    $srcDir = Split-Path $foundPrimary -Parent
-
-    # If we also need a secondary exe (ffprobe), ensure it’s in same folder or nearby
-    if ($SecondaryExeName) {
-        $foundSecondary = Find-FirstFile -Root $tmp -FileName $SecondaryExeName
-        if (-not $foundSecondary) {
-            throw "Downloaded $asset.Name but couldn't find $SecondaryExeName inside it."
-        }
-        $srcDir2 = Split-Path $foundSecondary -Parent
-        if ($srcDir2 -ne $srcDir) {
-            # If they are in different folders, copy both folder trees into installDir (simplest safe approach)
-            # We'll just copy from the common root to preserve needed DLLs/resources.
-            $srcDir = $tmp
-        }
-    }
-
-    # Install: copy the whole folder contents (keeps DLLs/models/etc)
-    if (Test-Path -LiteralPath $installDir) {
-        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Force $installDir | Out-Null
-    Get-ChildItem -LiteralPath $srcDir -Force -ErrorAction Stop |
-    Copy-Item -Destination $installDir -Recurse -Force -ErrorAction Stop
-
-
-    # Re-locate exe(s) inside install dir (in case they are in nested bin\)
-    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
-    if (-not $installedPrimary) { throw "Install succeeded but $PrimaryExeName not found under $installDir" }
-
-    $installedSecondary = $null
-    if ($SecondaryExeName) {
-        $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
-        if (-not $installedSecondary) { throw "Install succeeded but $SecondaryExeName not found under $installDir" }
-    }
-
-    # Cleanup temp extract
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-
-    return [pscustomobject]@{
-        InstallDir   = $installDir
-        PrimaryExe   = $installedPrimary
-        SecondaryExe = $installedSecondary
-        Source      = "${Owner}/${Repo}:$($asset.Tag)"
-    }
-}
-
-
-$toolDirs = @()
-
-if ($ffmpegPath) { $toolDirs += (Split-Path -Path $ffmpegPath -Parent) }
-if ($upscaylPathResolved) { $toolDirs += (Split-Path -Path $upscaylPathResolved -Parent) }
-
-$toolDirs = $toolDirs | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
-
-if ($toolDirs.Count -gt 0) {
-    $env:PATH = ($toolDirs -join ';') + ';' + $env:PATH
-}
-
-
-# Prefer system tools first
-$ffmpegPath  = Resolve-ExeOrNull "ffmpeg"
-$ffprobePath = Resolve-ExeOrNull "ffprobe"
-
-# Upscayl: either user provided a path, or try PATH
-$upscaylPathResolved = $null
-if ($PSBoundParameters.ContainsKey("UpscaylPath") -and (Test-Path -LiteralPath $UpscaylPath)) {
-    $upscaylPathResolved = (Resolve-Path -LiteralPath $UpscaylPath).Path
-} else {
-    $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin"
-    if (-not $upscaylPathResolved) { $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin.exe" }
-}
-
-$needDownload = (-not $ffmpegPath) -or (-not $ffprobePath) -or (-not $upscaylPathResolved)
-
-if ($needDownload) {
-    if (-not $AutoDownloadTools) {
-        throw ("Missing required tools. Install/provide them, or re-run with -AutoDownloadTools.`n" +
-               "ffmpeg  : {0}`nffprobe : {1}`nupscayl : {2}" -f $ffmpegPath, $ffprobePath, $upscaylPathResolved)
-    }
-
-    # Only now do your Get-FromGitHubReleaseZip calls
-    if ($AutoDownloadTools) {
-
-        # ---------------------------
-        # 1) FFmpeg + FFprobe from GyanD/codexffmpeg (*full_build.zip)
-        # ---------------------------
-        $ff = Get-FromGitHubReleaseZip `
-        -Owner "GyanD" `
-        -Repo "codexffmpeg" `
-        -AssetNameRegex 'ffmpeg-.*-full_build(-shared)?\.zip$' `
-        -InstallSubdir "ffmpeg" `
-        -PrimaryExeName "ffmpeg.exe" `
-        -SecondaryExeName "ffprobe.exe"
-
-        # ---------------------------
-        # 2) Upscayl (and whatever it bundles, potentially models) from upscayl/upscayl (*win.zip)
-        # ---------------------------
-        $up = Get-FromGitHubReleaseZip `
-        -Owner "upscayl" `
-        -Repo "upscayl" `
-        -AssetNameRegex '^upscayl-\d+\.\d+\.\d+-win\.zip$' `
-        -InstallSubdir "upscayl" `
-        -PrimaryExeName "upscayl-bin.exe"
-
-        # Override tool paths to downloaded versions
-        $ffmpegPath  = $ff.PrimaryExe
-        $ffprobePath = $ff.SecondaryExe
-        $UpscaylPath = $up.PrimaryExe
-        # Canonicalize: when we download, the resolved path is the downloaded one
-        $upscaylPathResolved = $up.PrimaryExe
-
-        # IMPORTANT: set the canonical vars the rest of the script uses
-        $script:FfmpegExe  = $ffmpegPath
-        $script:FfprobeExe = $ffprobePath
-        $script:UpscaylExe = $upscaylPathResolved
-
-
-    } else {
-        Write-Host "[Tools] AutoDownloadTools not set; skipping downloads."
-    }
-
-    
-    # Add downloaded tool dirs to PATH for this process (guard nulls)
-    $toolDirs = @()
-
-    if ($ffmpegPath -and (Test-Path -LiteralPath $ffmpegPath)) {
-        $toolDirs += (Split-Path -Parent $ffmpegPath)
-    }
-    if ($upscaylPathResolved -and (Test-Path -LiteralPath $upscaylPathResolved)) {
-        $toolDirs += (Split-Path -Parent $upscaylPathResolved)
-    }
-
-    $toolDirs = $toolDirs | Where-Object { $_ } | Select-Object -Unique
-    if ($toolDirs.Count -gt 0) {
-        $env:PATH = (($toolDirs -join ';') + ';' + $env:PATH)
-    }
-
-
-    Write-Host "[Tools] Using downloaded tools:"
-    Write-Host "  ffmpeg : $ffmpegPath ($($ff.Source))"
-    Write-Host "  ffprobe: $ffprobePath ($($ff.Source))"
-    Write-Host "  upscayl: $upscaylPathResolved ($($up.Source))"
-} else {
-    Write-Host "[Tools] Using system tools from PATH:"
-    Write-Host "  ffmpeg : $ffmpegPath"
-    Write-Host "  ffprobe: $ffprobePath"
-    Write-Host "  upscayl: $upscaylPathResolved"
-    
-    # IMPORTANT: set the canonical vars the rest of the script uses
-    $script:FfmpegExe  = $ffmpegPath
-    $script:FfprobeExe = $ffprobePath
-    $script:UpscaylExe = $upscaylPathResolved
-}
-
-# Now set the script variables you actually use
-$Upscayl = $upscaylPathResolved
-
-
-
-
-
-function Get-FromGitHubReleaseZip {
-    param(
-        [Parameter(Mandatory)][string]$Owner,
-        [Parameter(Mandatory)][string]$Repo,
-        [Parameter(Mandatory)][string]$AssetNameRegex,
-        [Parameter(Mandatory)][string]$InstallSubdir,
-        [Parameter(Mandatory)][string]$PrimaryExeName,
-        [string]$SecondaryExeName = ""
-    )
-
-    $installDir = Join-Path $ToolsRoot $InstallSubdir
-    
-    # Already installed?
-    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
-    if ($installedPrimary) {
-        $installedSecondary = $null
-        if ($SecondaryExeName) {
-            $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
-        }
-
-        return [pscustomobject]@{
-            InstallDir   = $installDir
-            PrimaryExe   = $installedPrimary
-            SecondaryExe = $installedSecondary
-            Source       = "cache"
-        }
-    }
-
-    $asset = Get-GitHubReleaseAsset -Owner $Owner -Repo $Repo -NameRegex $AssetNameRegex
-    Write-Host "[Tools] Downloading $Owner/$Repo $($asset.Tag) asset: $($asset.Name)"
-
-    $cacheDir = Join-Path $ToolsRoot "_cache"
-    New-Item -ItemType Directory -Force $cacheDir | Out-Null
-    $zipPath  = Join-Path $cacheDir $asset.Name
-
-    Invoke-DownloadFile -Url $asset.DownloadUrl -OutFile $zipPath
-
-    # Extract to temp then copy the folder that contains the exe(s)
-    $tmp = Join-Path $cacheDir ("extract_{0}_{1}" -f $InstallSubdir, ([guid]::NewGuid().ToString("N")))
-    Expand-ZipFresh -ZipPath $zipPath -DestDir $tmp
-
-    $foundPrimary = Find-FirstFile -Root $tmp -FileName $PrimaryExeName
-
-    # Upscayl releases may not ship "upscayl-bin.exe"; fall back to discovery
-    if (-not $foundPrimary -and $Repo -eq "upscayl") {
-        $foundPrimary = Resolve-UpscaylExe -RootDir $tmp
-    }
-
-    if (-not $foundPrimary) {
-        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName inside it (or any upscayl*.exe)."
-    }
-
-
-    $srcDir = Split-Path $foundPrimary -Parent
-
-    # If we also need a secondary exe (ffprobe), ensure it’s in same folder or nearby
-    if ($SecondaryExeName) {
-        $foundSecondary = Find-FirstFile -Root $tmp -FileName $SecondaryExeName
-        if (-not $foundSecondary) {
-            throw "Downloaded $asset.Name but couldn't find $SecondaryExeName inside it."
-        }
-        $srcDir2 = Split-Path $foundSecondary -Parent
-        if ($srcDir2 -ne $srcDir) {
-            # If they are in different folders, copy both folder trees into installDir (simplest safe approach)
-            # We'll just copy from the common root to preserve needed DLLs/resources.
-            $srcDir = $tmp
-        }
-    }
-
-    # Install: copy the whole folder contents (keeps DLLs/models/etc)
-    if (Test-Path -LiteralPath $installDir) {
-        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
-    }
-    New-Item -ItemType Directory -Force $installDir | Out-Null
-    Get-ChildItem -LiteralPath $srcDir -Force -ErrorAction Stop |
-    Copy-Item -Destination $installDir -Recurse -Force -ErrorAction Stop
-
-
-    # Re-locate exe(s) inside install dir (in case they are in nested bin\)
-    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
-    if (-not $installedPrimary) { throw "Install succeeded but $PrimaryExeName not found under $installDir" }
-
-    $installedSecondary = $null
-    if ($SecondaryExeName) {
-        $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
-        if (-not $installedSecondary) { throw "Install succeeded but $SecondaryExeName not found under $installDir" }
-    }
-
-    # Cleanup temp extract
-    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
-
-    return [pscustomobject]@{
-        InstallDir   = $installDir
-        PrimaryExe   = $installedPrimary
-        SecondaryExe = $installedSecondary
-        Source      = "${Owner}/${Repo}:$($asset.Tag)"
-    }
-}
-
-function Get-TargetDimsFromPreset {
-    param([Parameter(Mandatory)][pscustomobject]$Preset)
-
-    if ([string]::IsNullOrWhiteSpace($Preset.Scale)) {
-        return $null
-    }
-
-    $p = $Preset.Scale -split ":"
-    if ($p.Count -ne 2) { throw "Preset.Scale must be 'W:H' but was: $($Preset.Scale)" }
-
-    return [pscustomobject]@{
-        W = [int]$p[0]
-        H = [int]$p[1]
-    }
-}
-
-# ---------------------------
-# Canonical tool exe paths (downloaded)
-# ---------------------------
-
-$script:FfmpegExe  = $ff.PrimaryExe
-$script:FfprobeExe = $ff.SecondaryExe
-$script:UpscaylExe = $up.PrimaryExe
-
-# NOTE: validate *resolved paths*, not $script:* (those are set later)
-if ([string]::IsNullOrWhiteSpace($ffmpegPath)  -or -not (Test-Path -LiteralPath $ffmpegPath))  { throw "ffmpeg not found: '$ffmpegPath'" }
-if ([string]::IsNullOrWhiteSpace($ffprobePath) -or -not (Test-Path -LiteralPath $ffprobePath)) { throw "ffprobe not found: '$ffprobePath'" }
-if ([string]::IsNullOrWhiteSpace($upscaylPathResolved) -or -not (Test-Path -LiteralPath $upscaylPathResolved)) { throw "upscayl not found: '$upscaylPathResolved'" }
-
-$ffDir = Split-Path -Parent $ffmpegPath
-$upDir = Split-Path -Parent $upscaylPathResolved
-$env:PATH = "$ffDir;$upDir;$env:PATH"
-
-# If user explicitly provided -UpscaylPath, honor it (but fall back to downloaded if not found)
-if ($PSBoundParameters.ContainsKey('UpscaylPath')) {
-    try {
-        $resolvedUserUpscayl = Resolve-FullPath $script:UpscaylExe
-        if (Test-Path -LiteralPath $resolvedUserUpscayl) {
-            $script:UpscaylExe = $resolvedUserUpscayl
-        } else {
-            Write-Warning "User-specified UpscaylPath not found; using downloaded upscayl: $script:UpscaylExe"
-        }
-    } catch {
-        Write-Warning "Could not resolve user UpscaylPath; using downloaded upscayl: $script:UpscaylExe"
-    }
-}
-
-$ffDir = if ($script:FfmpegExe)  { Split-Path -Parent $script:FfmpegExe }  else { $null }
-$upDir = if ($script:UpscaylExe) { Split-Path -Parent $script:UpscaylExe } else { $null }
-
-if ($ffDir -and $upDir) {
-    $env:PATH = "$ffDir;$upDir;$env:PATH"
-}
-
-
-# ---- Canonicalize tooling vars (single source of truth) ----
-$script:FfmpegExe  = $ffmpegPath
-$script:FfprobeExe = $ffprobePath
-$script:UpscaylExe = $upscaylPathResolved
-
-if ([string]::IsNullOrWhiteSpace($script:FfmpegExe)  -or -not (Test-Path -LiteralPath $script:FfmpegExe))  {
-    throw "ffmpeg not found/resolved: '$script:FfmpegExe'"
-}
-if ([string]::IsNullOrWhiteSpace($script:FfprobeExe) -or -not (Test-Path -LiteralPath $script:FfprobeExe)) {
-    throw "ffprobe not found/resolved: '$script:FfprobeExe'"
-}
-if ([string]::IsNullOrWhiteSpace($script:UpscaylExe) -or -not (Test-Path -LiteralPath $script:UpscaylExe)) {
-    throw "upscayl not found/resolved: '$script:UpscaylExe'"
-}
-
-# Add tool dirs to PATH (nice-to-have)
-$ffDir = Split-Path -Parent $script:FfmpegExe
-$upDir = Split-Path -Parent $script:UpscaylExe
-$env:PATH = "$ffDir;$upDir;$env:PATH"
-
-# InputDir: default "source" already; resolve relative
-$InputDirFull = Join-Path $BaseDir $InputDir
-if (-not (Test-Path $InputDirFull)) { throw "Source directory not found: $InputDirFull" }
-$InputDirFull = (Resolve-Path $InputDirFull).Path
-
-# ---- Interactive fallback ONLY if not provided explicitly ----
-
-if (-not $PSBoundParameters.ContainsKey("InputDir")) {
-    $raw = Read-Host "Enter source directory (default: source)"
-    if (-not [string]::IsNullOrWhiteSpace($raw)) {
-        $InputDir = $raw
-        $InputDirFull = (Resolve-Path (Join-Path $BaseDir $InputDir)).Path
-    }
-}
-
-$GpuTag = if ($GpuIndex -ge 0) { "gpu$GpuIndex" } else { "gpuNA" }
-
-# ---------------- FUNCTIONS ----------------
-function Invoke-Ffmpeg  { & $script:FfmpegExe  @args }
-function Invoke-Ffprobe { & $script:FfprobeExe @args }
-function Invoke-Upscayl { & $script:UpscaylExe @args }
-function Get-UpscaylHelpText {
-    param([Parameter(Mandatory)][string]$script:UpscaylExe)
-
-    # cmd.exe captures stderr+stdout cleanly without PS "NativeCommandError" noise
-    $escaped = $script:UpscaylExe.Replace('"','""')
-    return (cmd /c """$escaped"" -h 2>&1") | Out-String
-}
-
-function Get-SafeName([string]$Name) {
-  $n = $Name -replace '[\p{Cc}]',''           # drop control chars
-  $n = $n -replace '[<>:"/\\|?*]','_'         # Windows-illegal in paths
-  $n = $n.Trim().TrimEnd('.')                 # avoid trailing dot
-  if ([string]::IsNullOrWhiteSpace($n)) { $n = "video" }
-  return $n
-}
-
 function Get-PixFmtFromVArgs {
     param([object[]]$VArgs)
 
@@ -1273,549 +633,6 @@ function Get-PixFmtFromVArgs {
     }
     return "n/a"
 }
-
-function Get-CounterSamples {
-    param([Parameter(Mandatory)][string]$Path)
-    try {
-        return (Get-Counter -Counter $Path -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop).CounterSamples
-    } catch {
-        return @()  # counter missing or inaccessible
-    }
-}
-function Get-GpuDedicatedVramPercent {
-    <#
-      Returns a hashtable: gpuIndex -> dedicated VRAM percent used (0-100)
-      Uses Windows perf counters:
-        \GPU Adapter Memory(*)\Dedicated Usage
-        \GPU Adapter Memory(*)\Dedicated Limit   (may not exist!)
-    #>
-
-    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
-    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty on some systems
-
-    if (-not $useS -or $useS.Count -eq 0) { return @{} }
-
-    # Map instance -> max usage/limit
-    $useMap = @{}
-    foreach ($s in $useS) { $useMap[$s.InstanceName] = [double]$s.CookedValue }
-
-    $limMap = @{}
-    foreach ($s in $limS) { $limMap[$s.InstanceName] = [double]$s.CookedValue }
-
-    # Aggregate by GPU index (gpu_#) across instances
-    $agg = @{}
-    foreach ($inst in $useMap.Keys) {
-        if ($inst -match 'gpu_(\d+)') {
-            $idx = [int]$Matches[1]
-            if (-not $agg.ContainsKey($idx)) { $agg[$idx] = [pscustomobject]@{ Use=0.0; Lim=0.0 } }
-
-            $agg[$idx].Use = [math]::Max($agg[$idx].Use, $useMap[$inst])
-            if ($limMap.ContainsKey($inst)) {
-                $agg[$idx].Lim = [math]::Max($agg[$idx].Lim, $limMap[$inst])
-            }
-        }
-    }
-
-    # Convert to percent (only where limit exists)
-    $out = @{}
-    foreach ($k in $agg.Keys) {
-        $useB = $agg[$k].Use
-        $limB = $agg[$k].Lim
-        if ($limB -gt 0) {
-            $out[$k] = [math]::Round(($useB / $limB) * 100, 1)
-        }
-    }
-
-    return $out
-}
-
-function Get-LockedGpus {
-    $locked = @()
-    Get-ChildItem -Directory "_ffv1_work_gpu*" -ErrorAction SilentlyContinue | ForEach-Object {
-        if ($_.Name -match 'gpu(\d+)') {
-            # Non-empty directory = active or incomplete job
-            $hasFiles = Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
-            if ($hasFiles) {
-                $locked += [int]$Matches[1]
-            }
-        }
-    }
-    return $locked
-}
-
-function Get-GpuUtilizationByLuid {
-    # Returns: LUID -> @{ Util3D = x; UtilCompute = y; UtilMax = z }
-    try {
-        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
-    } catch {
-        return @{}
-    }
-
-    $out = @{}
-
-    foreach ($s in $c.CounterSamples) {
-        $inst = $s.InstanceName
-
-        # Extract LUID
-        if ($inst -notmatch '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') { continue }
-        $luid = $Matches[1]
-
-        # Identify engine type
-        $is3D      = ($inst -like '*engtype_3D*')
-        $isCompute = ($inst -like '*engtype_Compute*')
-
-        if (-not ($is3D -or $isCompute)) { continue }
-
-        if (-not $out.ContainsKey($luid)) {
-            $out[$luid] = [pscustomobject]@{ Util3D = 0.0; UtilCompute = 0.0; UtilMax = 0.0 }
-        }
-
-        $val = [double]$s.CookedValue
-
-        if ($is3D) {
-            # Use MAX (summing can exceed 100 with multiple engines)
-            $out[$luid].Util3D = [math]::Max($out[$luid].Util3D, $val)
-        }
-        if ($isCompute) {
-            $out[$luid].UtilCompute = [math]::Max($out[$luid].UtilCompute, $val)
-        }
-
-        $out[$luid].UtilMax = [math]::Max($out[$luid].UtilMax, $val)
-    }
-
-    return $out
-}
-
-function Get-DiscreteVideoControllers {
-    $vc = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterCompatibility, PNPDeviceID, AdapterRAM
-
-    # Filter out obvious non-GPU / useless adapters
-    $vc = $vc | Where-Object {
-        $_.Name -and
-        $_.Name -notmatch 'Basic Display|Microsoft Remote|DisplayLink|Virtual|VMware|Hyper-V|Citrix|BCM|Broadcom' -and
-        $_.AdapterCompatibility -notmatch 'Microsoft'
-    }
-
-    # Prefer AMD/NVIDIA and larger VRAM
-    $vc | Sort-Object @{
-        Expression = {
-            $score = 0
-            if ($_.AdapterCompatibility -match 'NVIDIA|AMD|Advanced Micro Devices') { $score += 100 }
-            if ($_.Name -match 'NVIDIA|GeForce|RTX|Quadro') { $score += 50 }
-            if ($_.Name -match 'AMD|Radeon') { $score += 50 }
-            $ramGB = 0
-            if ($_.AdapterRAM) { $ramGB = [math]::Round($_.AdapterRAM / 1GB, 0) }
-            $score += [int]$ramGB
-            $score
-        }
-        Descending = $true
-    }
-}
-
-function Get-ActiveGpuLuids {
-    param(
-        [double]$MinVramGB = 2.0,
-        [double]$MinUtilPercent = 5.0
-    )
-
-    $util = Get-GpuUtilizationByLuid
-    $mem  = Get-GpuDedicatedUsageByLuid
-
-    $luids = New-Object System.Collections.Generic.List[string]
-
-    foreach ($luid in (($util.Keys + $mem.Keys) | Sort-Object -Unique)) {
-        $useGB = if ($mem.ContainsKey($luid)) { $mem[$luid].UseGB } else { 0.0 }
-        $umax  = if ($util.ContainsKey($luid)) { $util[$luid].UtilMax } else { 0.0 }
-
-        if ($useGB -ge $MinVramGB -or $umax -ge $MinUtilPercent) {
-            $luids.Add($luid)
-        }
-    }
-    return $luids
-}
-
-
-function Get-GpuDedicatedUsageByLuid {
-    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
-    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty
-
-    $limMap = @{}
-    foreach ($s in $limS) {
-        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
-            $limMap[$Matches[1]] = [double]$s.CookedValue
-        }
-    }
-
-    $out = @{}
-    foreach ($s in $useS) {
-        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
-            $luid = $Matches[1]
-            $useB = [double]$s.CookedValue
-            $limB = if ($limMap.ContainsKey($luid)) { [double]$limMap[$luid] } else { 0.0 }
-
-            $out[$luid] = [pscustomobject]@{
-                UseGB = [math]::Round($useB / 1GB, 2)
-                LimGB = [math]::Round($limB / 1GB, 2)
-                Pct   = if ($limB -gt 0) { [math]::Round(($useB / $limB) * 100, 1) } else { $null }
-            }
-        }
-    }
-    return $out
-}
-
-
-function Get-Gpu3DUtilization {
-    try {
-        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
-    } catch {
-        return @{}
-    }
-
-    $util = @{}
-
-    $c.CounterSamples |
-        Where-Object { $_.InstanceName -like '*engtype_3D*' } |
-        ForEach-Object {
-            if ($_.InstanceName -match 'gpu_(\d+)_') {
-                $idx = [int]$Matches[1]
-                if (-not $util.ContainsKey($idx)) { $util[$idx] = 0 }
-                $util[$idx] = [math]::Max($util[$idx], [double]$_.CookedValue)
-            }
-        }
-
-    # Round for readability
-    foreach ($k in $util.Keys) {
-        $util[$k] = [math]::Round($util[$k], 1)
-    }
-
-    return $util
-}
-
-function Test-AnyGpuBusyOrLocked {
-    param(
-        [int]$BusyThresholdPercent = 50,
-        [int]$BusyVramGB = 18,
-        [double]$MinActiveVramGB = 2.0,
-        [double]$MinActiveUtilPercent = 5.0
-    )
-
-    $locked = Get-LockedGpus
-    if ($locked.Count -gt 0) {
-        Write-Warning ("Locked GPUs (work dirs present): {0}" -f ($locked -join ", "))
-    }
-
-    $util = Get-GpuUtilizationByLuid
-    $mem  = Get-GpuDedicatedUsageByLuid
-
-    # Only consider "real" adapters (filters out BCM / 0GB junk)
-    $activeLuids = Get-ActiveGpuLuids -MinVramGB $MinActiveVramGB -MinUtilPercent $MinActiveUtilPercent
-    if (-not $activeLuids -or $activeLuids.Count -eq 0) {
-        Write-Host "`n[GPU Busy Check] (No active GPU LUIDs detected from counters)"
-        return
-    }
-
-    Write-Host "`n[GPU Busy Check | by LUID]"
-
-    $warn = @()
-
-    foreach ($luid in ($activeLuids | Sort-Object)) {
-        $u3d  = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].Util3D, 2) } else { 0.0 }
-        $ucmp = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].UtilCompute, 2) } else { 0.0 }
-        $umax = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].UtilMax, 2) } else { 0.0 }
-
-        $useGB = if ($mem.ContainsKey($luid)) { $mem[$luid].UseGB } else { 0.0 }
-        $limGB = if ($mem.ContainsKey($luid)) { $mem[$luid].LimGB } else { 0.0 }
-        $pct   = if ($mem.ContainsKey($luid)) { $mem[$luid].Pct } else { $null }
-
-        $pctText = if ($null -ne $pct) { "$pct%" } else { "n/a" }
-
-        Write-Host ("  {0,-30}  3D={1,7}%  Compute={2,7}%  Max={3,7}%  VRAM={4,6}GB / {5,6}GB ({6})" -f `
-            $luid, $u3d, $ucmp, $umax, $useGB, $limGB, $pctText)
-
-        if ($umax -ge $BusyThresholdPercent) {
-            $warn += "LUID $luid utilization is high (MaxEng=$umax%)"
-        }
-
-        if ($null -ne $pct) {
-            if ($pct -ge $BusyThresholdPercent) { $warn += "LUID $luid VRAM is high ($pct%)" }
-        } else {
-            if ($useGB -ge $BusyVramGB) { $warn += "LUID $luid VRAM is high by usage ($useGB GB ≥ $BusyVramGB GB) (limit counter unavailable)" }
-        }
-    }
-
-    if ($warn.Count -gt 0) {
-        Write-Warning "One or more GPUs look busy:"
-        $warn | ForEach-Object { Write-Warning "  - $_" }
-
-        $resp = Read-Host "Continue anyway? (Y/N)"
-        if ($resp.Trim().ToUpper() -ne "Y") { throw "Aborted due to GPU busy warning" }
-    }
-}
-
-
-function Get-GpuMemoryByLuid {
-    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
-    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty
-
-    if (-not $useS -or $useS.Count -eq 0) { return @() }
-
-    $limMap = @{}
-    foreach ($s in $limS) {
-        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
-            $limMap[$Matches[1]] = [double]$s.CookedValue
-        }
-    }
-
-    $out = @()
-    foreach ($s in $useS) {
-        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
-            $luid = $Matches[1]
-            $useB = [double]$s.CookedValue
-            $limB = if ($limMap.ContainsKey($luid)) { [double]$limMap[$luid] } else { 0.0 }
-
-            $out += [pscustomobject]@{
-                Luid = $luid
-                DedicatedUsageBytes = $useB
-                DedicatedLimitBytes = $limB
-            }
-        }
-    }
-
-    return $out
-}
-
-function Get-GpuEngine3DUtilByLuid {
-    # Returns objects keyed by LUID with summed 3D utilization (0-100)
-    # Counter instance name looks like:
-    # "pid_0x0_luid_0x00000000_0x0000..._phys_0_engtype_3D"
-    try {
-        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
-    } catch {
-        return @()
-    }
-
-    $samples = $c.CounterSamples | Where-Object {
-        $_.InstanceName -like '*engtype_3D*'
-    }
-
-    $groups = $samples | Group-Object -Property {
-        if ($_.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') { $Matches[1] } else { 'unknown' }
-    }
-
-    foreach ($g in $groups) {
-        [pscustomobject]@{
-            Luid = $g.Name
-            Util3D = [math]::Round( ($g.Group | Measure-Object -Property CookedValue -Sum).Sum, 2 )
-        }
-    }
-}
-
-function Show-GpuEngineSnapshot {
-    $util = Get-GpuEngine3DUtilByLuid
-    $mem  = Get-GpuMemoryByLuid
-
-    Write-Host "`n[GPU Engine 3D Utilization by LUID]"
-    if (-not $util -or $util.Count -eq 0) {
-        Write-Host "  (No GPU Engine counters available)"
-    } else {
-        $util | Sort-Object Util3D -Descending | ForEach-Object {
-            Write-Host ("  {0,-30}  {1,8} %" -f $_.Luid, $_.Util3D)
-        }
-    }
-
-    Write-Host "`n[GPU Dedicated Memory by LUID]"
-    if (-not $mem -or $mem.Count -eq 0) {
-        Write-Host "  (No GPU Adapter Memory counters available)"
-    } else {
-        $mem | Sort-Object DedicatedLimitBytes -Descending | ForEach-Object {
-            $uGB = [math]::Round($_.DedicatedUsageBytes / 1GB, 2)
-            $lGB = if ($_.DedicatedLimitBytes -gt 0) { [math]::Round($_.DedicatedLimitBytes / 1GB, 2) } else { $null }
-            Write-Host ("  {0,-30}  {1,7} GB / {2,7} GB" -f $_.Luid, $uGB, $lGB)
-        }
-    }
-}
-function Get-UpscaylGpuList {
-    param([Parameter(Mandatory)][string]$script:UpscaylExe)
-
-    $out = & $script:UpscaylExe -h 2>&1 | Out-String
-    if (-not $out) { $out = & $script:UpscaylExe 2>&1 | Out-String }
-
-    $gpus = @()
-
-    foreach ($line in ($out -split "`r?`n")) {
-        $t = $line.Trim()
-
-        # Accept formats like:
-        # [0 AMD Radeon ...]
-        # 0: AMD Radeon ...
-        # GPU 0 - AMD Radeon ...
-        if ($t -match '^\[(\d+)\s+(.+?)\]') {
-            $gpus += [pscustomobject]@{ Index=[int]$Matches[1]; Name=$Matches[2].Trim(); Raw=$t }
-            continue
-        }
-        if ($t -match '^(?:GPU\s*)?(\d+)\s*[:\-]\s*(.+)$') {
-            $gpus += [pscustomobject]@{ Index=[int]$Matches[1]; Name=$Matches[2].Trim(); Raw=$t }
-            continue
-        }
-    }
-
-    return $gpus
-}
-
-
-function Select-UpscaylGpuIndexAuto {
-    param(
-        [Parameter(Mandatory)][string]$script:UpscaylExe,
-        [switch]$PreferDiscrete
-    )
-
-    $up = Get-UpscaylGpuList -UpscaylPath $script:UpscaylExe
-    if (-not $up -or $up.Count -eq 0) {
-        Write-Warning "Couldn't parse Upscayl GPU list. Falling back to GPU 0."
-        return 0
-    }
-
-    $vc = Get-DiscreteVideoControllers
-
-    # Util + VRAM by LUID (Windows counters)
-    #$util = Get-GpuEngine3DUtilByLuid
-    #$mem  = Get-GpuMemoryByLuid
-
-    # Build a "discrete-ish" guess list from Windows adapters
-    # (AMD/NVIDIA typically discrete; Intel typically integrated)
-    $discreteNames = @()
-    if ($PreferDiscrete) {
-        $discreteNames = $vc | Where-Object {
-            $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices|NVIDIA' -or $_.Name -match 'AMD|Radeon|NVIDIA|GeForce|RTX|GTX'
-        } | ForEach-Object { $_.Name }
-    }
-
-    # If we can’t map LUID -> Upscayl index perfectly, we do best-effort:
-    # - Prefer Upscayl device names that match a discrete adapter name
-    # - Use engine utilization totals as a tie-breaker if available (global low utilization)
-    # - Prefer higher Dedicated Limit (discrete tends to have large dedicated limit)
-    #
-    # We can’t directly map Upscayl index to LUID without extra DXGI plumbing,
-    # so we use a pragmatic approach:
-    #   choose the Upscayl GPU that matches a discrete name first.
-    $candidates = $up
-
-    if ($PreferDiscrete -and $discreteNames.Count -gt 0) {
-        $disc = @()
-        foreach ($g in $up) {
-            foreach ($n in $discreteNames) {
-                if ($g.Name -and $n -and ($g.Name -like "*$($n.Split(' ')[0])*" -or $n -like "*$($g.Name.Split(' ')[0])*" -or $g.Name -match 'Radeon|NVIDIA|GeForce|RTX|GTX')) {
-                    $disc += $g
-                    break
-                }
-            }
-        }
-        if ($disc.Count -gt 0) { $candidates = $disc }
-    }
-
-    # If we have memory counters, prefer the adapter with the largest dedicated limit
-    # (this usually corresponds to the discrete card). We can only use this as a heuristic:
-    $best = $candidates | Select-Object -First 1
-
-    # If multiple candidates, pick the one that "looks" best by name (XTX/XT/RTX etc.)
-    if ($candidates.Count -gt 1) {
-        $best = $candidates |
-          Sort-Object -Property @{
-              Expression = {
-                  # crude scoring by keywords
-                  $s = 0
-                  if ($_.Name -match 'XTX|XT|RTX|4090|4080|4070|7900|7800|7700|6950|6900') { $s += 10 }
-                  if ($_.Name -match 'Radeon|NVIDIA|GeForce') { $s += 5 }
-                  $s
-              }
-              Descending = $true
-          } | Select-Object -First 1
-    }
-
-    return $best.Index
-}
-
-# ---------------- GPU SELECTION (after functions exist) ----------------
-
-# Only pick GPU if we actually need it for work.
-# For pure -DryRun, we can skip GPU logic entirely.
-if (-not $DryRun) {
-
-    if ($GpuIndex -lt 0) {
-        $gpuInput = Read-Host "GPU index for Upscayl (Enter = auto)"
-        if ([string]::IsNullOrWhiteSpace($gpuInput)) {
-            $GpuIndex = -1   # auto
-        } else {
-            if ($gpuInput -notmatch '^\d+$') { throw "GPU index must be numeric" }
-            $GpuIndex = [int]$gpuInput
-        }
-
-    }
-
-    # -1 means "Upscayl auto" and is allowed.
-
-    Test-AnyGpuBusyOrLocked -BusyThresholdPercent $BusyThresholdPercent
-}
-
-# ---------------- END GPU SELECTION ----------------
-
-$GpuTag = if ($GpuIndex -ge 0) { "gpu$GpuIndex" } else { "gpuAuto" }
-
-# Compute WorkDir/OutputDir if not provided
-if ([string]::IsNullOrWhiteSpace($WorkDir)) {
-    $WorkDir = Join-Path $BaseDir "_ffv1_work_$GpuTag"
-} else {
-    $WorkDir = Join-Path $BaseDir $WorkDir
-}
-if ([string]::IsNullOrWhiteSpace($OutputDir)) {
-    switch ($OutputPreset) {
-        "h264_4k_mp4"     { $OutputDir = Join-Path $BaseDir "h264_4k_$GpuTag" }
-        "hevc_4k_mp4"     { $OutputDir = Join-Path $BaseDir "hevc_4k_$GpuTag" }
-        "prores_4k_mov"   { $OutputDir = Join-Path $BaseDir "prores_4k_$GpuTag" }
-        "av1_4k_mkv"      { $OutputDir = Join-Path $BaseDir "av1_4k_$GpuTag" }
-        "av1_4k_mp4"      { $OutputDir = Join-Path $BaseDir "av1_4k_$GpuTag" }
-        "ffv1_1080p_mkv" { $OutputDir = Join-Path $BaseDir "ffv1_1080p_$GpuTag" }
-        "ffv1_4k_mkv"    { $OutputDir = Join-Path $BaseDir "ffv1_4k_$GpuTag" }
-        "av1_1080p_mkv"  { $OutputDir = Join-Path $BaseDir "av1_1080p_$GpuTag" }
-        "av1_1080p_mp4"  { $OutputDir = Join-Path $BaseDir "av1_1080p_$GpuTag" }
-        default          { $OutputDir = Join-Path $BaseDir "output_$OutputPreset`_$GpuTag" }
-    }
-} else {
-    $OutputDir = Join-Path $BaseDir $OutputDir
-}
-
-New-Item -ItemType Directory -Force $WorkDir   | Out-Null
-New-Item -ItemType Directory -Force $OutputDir | Out-Null
-
-# Replace your old $InputDir usage with $InputDirFull going forward
-$InputDir = $InputDirFull
-$Upscayl = $script:UpscaylExe
-
-function Test-OutputValid {
-    param(
-        [Parameter(Mandatory)][string]$file,
-        [switch]$RequireAudio
-    )
-    if (-not (Test-Path -LiteralPath $file)) { return $false }
-
-    # ask ffprobe for codec_type for ALL streams
-    $types = & $script:FfprobeExe -v error `
-        -show_entries stream=codec_type `
-        -of csv=p=0 `
-        "file:$file" 2>$null
-
-    if (-not $types) { return $false }
-
-    $hasVideo = ($types -match 'video')
-    $hasAudio = ($types -match 'audio')
-
-    if (-not $hasVideo) { return $false }
-    if ($RequireAudio -and (-not $hasAudio)) { return $false }
-
-    return $true
-}
-
-
 function Get-OutputPresetConfig {
     param(
         [Parameter(Mandatory)][string]$PresetName
@@ -2001,7 +818,493 @@ function Get-OutputPathForPreset {
     $suffix = $Preset.Name
     return (Join-Path $OutputDir ("{0}_{1}_{2}.{3}" -f $BaseName, $suffix, $GpuTag, $Preset.Ext))
 }
+function Test-FramesMatchTarget{
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FfmpegExe,
+        [Parameter(Mandatory)][string]$FfprobeExe,
 
+        [Parameter(Mandatory)][string]$UpscaledFramesDir,
+
+        [Parameter(Mandatory)][int]$TargetW,
+        [Parameter(Mandatory)][int]$TargetH,
+
+        # Where normalized frames will go IF needed
+        [Parameter(Mandatory)][string]$NormalizedFramesDir,
+
+        # Your frame pattern like frame_%06d.png or similar
+        [Parameter(Mandatory)][string]$FramePattern,
+
+        # If your frames are PNG keep png; if JPG keep jpg
+        [Parameter][ValidateSet("png","jpg")][string]$OutExt = "png",
+
+        # Aspect policy: "Pad" = keep AR, add bars; "Crop" = fill frame; "Stretch" = force
+        [ValidateSet("Pad","Crop","Stretch")]
+        [string]$AspectPolicy = "Pad",
+
+        [switch]$DryRun
+    )
+
+    $sample = Get-SampleFramePath -FramesDir $UpscaledFramesDir
+    if (-not $sample) { throw "No frames found in: $UpscaledFramesDir" }
+
+    $size = Get-ImageSize -FfprobeExe $FfprobeExe -ImagePath $sample
+    Write-Host ("[Frames] Upscayl sample: {0}x{1} (target {2}x{3})" -f $size.Width,$size.Height,$TargetW,$TargetH)
+
+    if ($size.Width -eq $TargetW -and $size.Height -eq $TargetH) {
+        Write-Host "[Frames] Already matches target; skipping normalization."
+        return $UpscaledFramesDir
+    }
+
+    Write-Warning "[Frames] Mismatch: will normalize with ffmpeg to exact target size."
+
+    if ($DryRun) {
+        Write-Host "[DryRun] Would normalize frames to $TargetW x $TargetH into: $NormalizedFramesDir"
+        return $NormalizedFramesDir
+    }
+
+    New-Item -ItemType Directory -Force -Path $NormalizedFramesDir | Out-Null
+
+    # Build vf per policy
+    $vf = switch ($AspectPolicy) {
+        "Pad" {
+            # keep AR, fit inside, pad to exact
+            # setsar=1 keeps square pixels
+            # Pad
+            "scale=w=${TargetW}:h=${TargetH}:force_original_aspect_ratio=decrease,pad=${TargetW}:${TargetH}:(ow-iw)/2:(oh-ih)/2,setsar=1"
+
+        }
+        "Crop" {
+            # keep AR, fill, then crop to exact
+            # Crop
+            "scale=w=${TargetW}:h=${TargetH}:force_original_aspect_ratio=increase,crop=${TargetW}:${TargetH},setsar=1"
+        }
+        "Stretch" {
+            # force exact (may distort)
+            # Stretch
+            "scale=w=${TargetW}:h=${TargetH},setsar=1"
+        }
+    }
+
+    $inPattern  = Join-Path $UpscaledFramesDir $FramePattern
+    $outPattern = Join-Path $NormalizedFramesDir ($FramePattern -replace '\.\w+$', ".$OutExt")
+
+    Write-Host "[Frames] Normalizing with vf: $vf"
+
+    & $FfmpegExe @(
+        "-hide_banner","-loglevel","error",
+        "-y",
+        "-i", $inPattern,
+        "-vf", $vf,
+        # keep lossless-ish for PNG; adjust if you use JPG
+        $outPattern
+    )
+
+    # Validate normalized sample
+    $sample2 = Get-SampleFramePath -FramesDir $NormalizedFramesDir
+    if (-not $sample2) { throw "Normalization produced no frames in: $NormalizedFramesDir" }
+
+    $size2 = Get-ImageSize -FfprobeExe $FfprobeExe -ImagePath $sample2
+    if ($size2.Width -ne $TargetW -or $size2.Height -ne $TargetH) {
+        throw "Normalization failed: got $($size2.Width)x$($size2.Height) expected $TargetW x $TargetH"
+    }
+
+    Write-Host "[Frames] Normalization OK."
+    return $NormalizedFramesDir
+}
+function Test-OutputValid {
+    param(
+        [Parameter(Mandatory)][string]$file,
+        [switch]$RequireAudio
+    )
+    if (-not (Test-Path -LiteralPath $file)) { return $false }
+
+    # ask ffprobe for codec_type for ALL streams
+    $types = & $script:FfprobeExe -v error `
+        -show_entries stream=codec_type `
+        -of csv=p=0 `
+        "file:$file" 2>$null
+
+    if (-not $types) { return $false }
+
+    $hasVideo = ($types -match 'video')
+    $hasAudio = ($types -match 'audio')
+
+    if (-not $hasVideo) { return $false }
+    if ($RequireAudio -and (-not $hasAudio)) { return $false }
+
+    return $true
+}
+function Get-SampleFramePath {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$FramesDir
+    )
+
+    if (-not (Test-Path -LiteralPath $FramesDir)) { return $null }
+
+    # pick the first png/jpg we find (sorted) as a sample
+    return Get-ChildItem -LiteralPath $framesDir -File -ErrorAction SilentlyContinue |
+    Where-Object { $_.Extension -match '^\.((png|jpg|jpeg|webp))$' } |
+    Sort-Object Name |
+    Select-Object -First 1 |
+    ForEach-Object FullName
+
+}
+# -------------------------
+# 4. Tool discovery & dependency acquisition
+# -------------------------
+function Resolve-ExeFromPath {
+    param([Parameter(Mandatory)][string]$Name)
+    $cmd = Get-Command $Name -ErrorAction SilentlyContinue
+    if ($cmd -and $cmd.Source) { return $cmd.Source }
+    return $null
+}
+function Resolve-ExeCandidate {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Path)) { return $null }
+        if (Test-Path -LiteralPath $Path) { return (Resolve-Path -LiteralPath $Path).Path }
+    } catch { }
+    return $null
+}
+function Find-ExeInDir {
+    param(
+        [Parameter(Mandatory)][string]$Dir,
+        [Parameter(Mandatory)][string[]]$Names
+    )
+    foreach ($n in $Names) {
+        $p = Join-Path $Dir $n
+        $r = Resolve-ExeCandidate -Path $p
+        if ($r) { return $r }
+    }
+    return $null
+}
+function Resolve-UpscaylExe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RootDir
+    )
+
+    if (-not (Test-Path -LiteralPath $RootDir)) { return $null }
+
+    # Upscayl zips vary; find anything that looks like the main exe.
+    $candidates = Get-ChildItem -LiteralPath $RootDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Extension -ieq ".exe" -and
+            $_.Name -imatch '^upscayl.*\.exe$' -and
+            $_.Name -inotmatch 'unins|uninstall'
+        }
+
+    if (-not $candidates) { return $null }
+
+    # Prefer your older naming if it exists
+    $preferred = $candidates | Where-Object { $_.Name -ieq "upscayl-bin.exe" } | Select-Object -First 1
+    if ($preferred) { return $preferred.FullName }
+
+    # Otherwise pick the shortest path (usually the real app exe, not buried junk)
+    return ($candidates | Sort-Object @{Expression={ $_.FullName.Length }} | Select-Object -First 1).FullName
+}
+function Resolve-UpscaylModelsDir {
+    param(
+        [Parameter(Mandatory)][string]$UpscaylExe,
+        [Parameter(Mandatory)][string]$ModelName
+    )
+
+    $exeDir   = Split-Path -Parent $UpscaylExe                 # ...\resources\bin
+    $rootDir  = Split-Path -Parent $exeDir                     # ...\resources
+
+    $candidates = @(
+        (Join-Path $exeDir  "models"),   # ...\resources\bin\models
+        (Join-Path $rootDir "models")    # ...\resources\models  <-- your case
+    ) | Select-Object -Unique
+
+    foreach ($d in $candidates) {
+        if (-not (Test-Path -LiteralPath $d)) { continue }
+
+        $param = Join-Path $d "$ModelName.param"
+        $bin   = Join-Path $d "$ModelName.bin"
+
+        if ((Test-Path -LiteralPath $param) -and (Test-Path -LiteralPath $bin)) {
+            return (Resolve-Path -LiteralPath $d).Path
+        }
+    }
+
+    # fallback: if folder exists but model files weren’t found (still better than nothing)
+    foreach ($d in $candidates) {
+        if (Test-Path -LiteralPath $d) { return (Resolve-Path -LiteralPath $d).Path }
+    }
+
+    throw "Upscayl models folder not found near '$UpscaylExe'. Tried: $($candidates -join ', ')"
+}
+function Resolve-VideoTools {
+    [CmdletBinding()]
+    param(
+        [string]$FfmpegExe,
+        [string]$FfprobeExe,
+        [string]$UpscaylExe,
+
+        [switch]$AutoDownloadTools,
+
+        [string]$ToolsDir = (Join-Path $PSScriptRoot "tools")
+    )
+
+    function _ResolveOne {
+        param(
+            [Parameter(Mandatory)][string]$Name,
+            [string]$PreferredPath,
+            [string]$CommandName,
+            [string[]]$ScriptDirCandidates = @(),
+            [switch]$WasExplicitlyProvided
+        )
+
+        # 1) If user explicitly provided a path: validate or throw
+        # 1) Explicit path wins (if supplied)
+        if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
+
+            # If relative, make it relative to the script folder (NOT the current working dir)
+            $p = $PreferredPath
+            if (-not [IO.Path]::IsPathRooted($p)) {
+                $p = Join-Path $PSScriptRoot $p
+            }
+
+            if (Test-Path -LiteralPath $p) {
+                return (Resolve-Path -LiteralPath $p).Path
+            }
+
+            # If AutoDownloadTools is enabled, don't hard-fail yet.
+            if ($AutoDownloadTools) { return $null }
+
+            throw "$Name path was provided but not found: $PreferredPath (resolved to '$p')"
+        }
+
+        # 2) Try script-folder candidates (only when not explicitly provided)
+        foreach ($cand in $ScriptDirCandidates) {
+            $p = Join-Path $PSScriptRoot $cand
+            if (Test-Path -LiteralPath $p) {
+                return (Resolve-Path -LiteralPath $p).Path
+            }
+        }
+
+        # 3) Try PATH
+        $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
+        if ($cmd -and $cmd.Source) { return $cmd.Source }
+
+        return $null
+    }
+
+    $resolved = [ordered]@{
+        ffmpeg  = _ResolveOne -Name "ffmpeg"  -PreferredPath $FfmpegExe  -CommandName "ffmpeg"  -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfmpegExe')
+        ffprobe = _ResolveOne -Name "ffprobe" -PreferredPath $FfprobeExe -CommandName "ffprobe" -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfprobeExe')
+        upscayl = _ResolveOne -Name "upscayl" -PreferredPath $UpscaylExe -CommandName "upscayl-bin.exe" `
+                    -ScriptDirCandidates @("upscayl-bin.exe","upscayl.exe","upscayl-bin") `
+                    -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('UpscaylExe')
+    }
+
+    if ($AutoDownloadTools) {
+        foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
+            if (-not $resolved[$k]) {
+                # hook your downloader here
+            }
+        }
+    }
+
+    if ($AutoDownloadTools) {
+        Ensure-VideoToolsDownloaded -ToolsDir $ToolsDir   # <— your download function
+        $resolved = Resolve-VideoTools -FfmpegExe $FfmpegExe -FfprobeExe $FfprobeExe -UpscaylExe $UpscaylExe -AutoDownloadTools:$AutoDownloadTools
+    }
+
+    # Final validation after download attempt
+    foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
+        if (-not $resolved[$k]) {
+            throw "[Tools] Still missing required tool after download attempt: $k"
+        }
+    }
+        $script:Tools = [pscustomobject]@{
+            Ffmpeg  = $resolved.ffmpeg
+            Ffprobe = $resolved.ffprobe
+            Upscayl = $resolved.upscayl
+        }
+
+        return $script:Tools
+}
+function Invoke-GitHubApi {
+    param([Parameter(Mandatory)][string]$Url)
+
+    $headers = @{
+        "User-Agent" = "Video-Upscale-Script"
+        "Accept"     = "application/vnd.github+json"
+    }
+
+    # Optional: if you want to avoid rate limits, set env var GITHUB_TOKEN
+    if ($env:GITHUB_TOKEN) {
+        $headers["Authorization"] = "Bearer $($env:GITHUB_TOKEN)"
+    }
+
+    return Invoke-RestMethod -Uri $Url -Headers $headers -Method Get -ErrorAction Stop
+}
+function Get-GitHubReleaseAsset {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$NameRegex,   # e.g. 'full_build\.zip$'
+        [ValidateSet("latest","all")][string]$Mode = "latest"
+    )
+
+    $api =
+        if ($Mode -eq "latest") {
+            "https://api.github.com/repos/$Owner/$Repo/releases/latest"
+        } else {
+            "https://api.github.com/repos/$Owner/$Repo/releases"
+        }
+
+    $rel = Invoke-GitHubApi -Url $api
+
+    # If Mode=all, $rel is an array; pick first release that has a matching asset
+    $releases = @()
+    if ($Mode -eq "all") { $releases = @($rel) } else { $releases = @($rel) }
+
+    foreach ($r in $releases) {
+        $asset = @($r.assets) | Where-Object { $_.name -match $NameRegex } | Select-Object -First 1
+        if ($asset) {
+            return [pscustomobject]@{
+                Tag          = $r.tag_name
+                Name         = $asset.name
+                DownloadUrl  = $asset.browser_download_url
+                SizeBytes    = $asset.size
+                UpdatedAt    = $asset.updated_at
+            }
+        }
+    }
+
+    throw "No asset matching regex '$NameRegex' found for $Owner/$Repo."
+}
+function Invoke-DownloadFile {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$OutFile
+    )
+    New-Item -ItemType Directory -Force (Split-Path $OutFile -Parent) | Out-Null
+
+    $bits = Get-Command Start-BitsTransfer -ErrorAction SilentlyContinue
+    if ($bits) {
+        Start-BitsTransfer -Source $Url -Destination $OutFile -ErrorAction Stop
+    } else {
+        Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -ErrorAction Stop
+    }
+}
+function Expand-ZipFresh {
+    param(
+        [Parameter(Mandatory)][string]$ZipPath,
+        [Parameter(Mandatory)][string]$DestDir
+    )
+    if (Test-Path -LiteralPath $DestDir) {
+        Remove-Item -LiteralPath $DestDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force $DestDir | Out-Null
+    Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestDir -Force
+}
+function Get-FromGitHubReleaseZip {
+    param(
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$AssetNameRegex,
+        [Parameter(Mandatory)][string]$InstallSubdir,
+        [Parameter(Mandatory)][string]$PrimaryExeName,
+        [string]$SecondaryExeName = ""
+    )
+
+    $installDir = Join-Path $ToolsRoot $InstallSubdir
+    
+    # Already installed?
+    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
+    if ($installedPrimary) {
+        $installedSecondary = $null
+        if ($SecondaryExeName) {
+            $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
+        }
+
+        return [pscustomobject]@{
+            InstallDir   = $installDir
+            PrimaryExe   = $installedPrimary
+            SecondaryExe = $installedSecondary
+            Source       = "cache"
+        }
+    }
+
+    $asset = Get-GitHubReleaseAsset -Owner $Owner -Repo $Repo -NameRegex $AssetNameRegex
+    Write-Host "[Tools] Downloading $Owner/$Repo $($asset.Tag) asset: $($asset.Name)"
+
+    $cacheDir = Join-Path $ToolsRoot "_cache"
+    New-Item -ItemType Directory -Force $cacheDir | Out-Null
+    $zipPath  = Join-Path $cacheDir $asset.Name
+
+    Invoke-DownloadFile -Url $asset.DownloadUrl -OutFile $zipPath
+
+    # Extract to temp then copy the folder that contains the exe(s)
+    $tmp = Join-Path $cacheDir ("extract_{0}_{1}" -f $InstallSubdir, ([guid]::NewGuid().ToString("N")))
+    Expand-ZipFresh -ZipPath $zipPath -DestDir $tmp
+
+    $foundPrimary = Find-FirstFile -Root $tmp -FileName $PrimaryExeName
+
+    # Upscayl releases may not ship "upscayl-bin.exe"; fall back to discovery
+    if (-not $foundPrimary -and $Repo -eq "upscayl") {
+        $foundPrimary = Resolve-UpscaylExe -RootDir $tmp
+    }
+
+    if (-not $foundPrimary) {
+        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName (or any upscayl*.exe) inside it."
+    }
+
+    # IMPORTANT: for Upscayl, copy the *whole extracted tree* so DLLs/resources come along
+    $srcDir = if ($Repo -eq "upscayl") { $tmp } else { (Split-Path $foundPrimary -Parent) }
+
+    # If we also need a secondary exe (ffprobe), ensure it’s in same folder or nearby
+    if ($SecondaryExeName) {
+        $foundSecondary = Find-FirstFile -Root $tmp -FileName $SecondaryExeName
+        if (-not $foundSecondary) {
+            throw "Downloaded $asset.Name but couldn't find $SecondaryExeName inside it."
+        }
+        $srcDir2 = Split-Path $foundSecondary -Parent
+        if ($srcDir2 -ne $srcDir) {
+            # If they are in different folders, copy both folder trees into installDir (simplest safe approach)
+            # We'll just copy from the common root to preserve needed DLLs/resources.
+            $srcDir = $tmp
+        }
+    }
+
+    # Install: copy the whole folder contents (keeps DLLs/models/etc)
+    if (Test-Path -LiteralPath $installDir) {
+        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force $installDir | Out-Null
+    Get-ChildItem -LiteralPath $srcDir -Force -ErrorAction Stop |
+    Copy-Item -Destination $installDir -Recurse -Force -ErrorAction Stop
+
+
+    # Re-locate exe(s) inside install dir (in case they are in nested bin\)
+    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
+    if (-not $installedPrimary) { throw "Install succeeded but $PrimaryExeName not found under $installDir" }
+
+    $installedSecondary = $null
+    if ($SecondaryExeName) {
+        $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
+        if (-not $installedSecondary) { throw "Install succeeded but $SecondaryExeName not found under $installDir" }
+    }
+
+    # Cleanup temp extract
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+    return [pscustomobject]@{
+        InstallDir   = $installDir
+        PrimaryExe   = $installedPrimary
+        SecondaryExe = $installedSecondary
+        Source      = "${Owner}/${Repo}:$($asset.Tag)"
+    }
+}
+# -------------------------
+# 6. Video metadata helpers
+# -------------------------
 function Get-VideoInfo {
     param([Parameter(Mandatory)][string]$Path)
 
@@ -2050,7 +1353,6 @@ function Get-VideoInfo {
         AChannels    = $a.channels
     }
 }
-
 function Show-VideoInfo {
     param([Parameter(Mandatory)]$Info)
 
@@ -2063,94 +1365,27 @@ function Show-VideoInfo {
     Write-Host ("  Bitrate   : ~{0} kb/s" -f $Info.BitrateKbps)
     Write-Host ""
 }
-function Get-UpscaleTarget {
-    param(
-        [Parameter(Mandatory)]$SrcInfo
-    )
-
-    # Keep it simple: user chooses a target "profile"
-$choices = @(
-    [pscustomobject]@{ Key="1";  Preset="av1_4k_mkv";       Name="UHD-Modern: 4K AV1 + Opus in MKV (best size)";
-        W=3840; H=2160; Container="mkv"; VCodec="av1";  ACodec="opus"; PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="2";  Preset="av1_4k_mp4";       Name="UHD-Modern: 4K AV1 + AAC in MP4 (best size + compatibility)";
-        W=3840; H=2160; Container="mp4"; VCodec="av1";  ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="3";  Preset="hevc_4k_mp4";      Name="UHD-Standard: 4K HEVC CRF 22 in MP4 (smaller, good quality)";
-        W=3840; H=2160; Container="mp4"; VCodec="hevc"; ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="4";  Preset="h264_4k_mp4";      Name="UHD-Legacy: 4K H.264 CRF 20 in MP4 (bigger, compatible)";
-        W=3840; H=2160; Container="mp4"; VCodec="h264"; ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="5";  Preset="av1_1080p_mkv";    Name="HD-Modern: 1080p AV1 + Opus in MKV (best size)";
-        W=1920; H=1080; Container="mkv"; VCodec="av1";  ACodec="opus"; PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="6";  Preset="av1_1080p_mp4";    Name="HD-Modern: 1080p AV1 + AAC in MP4 (best size + compatibility)";
-        W=1920; H=1080; Container="mp4"; VCodec="av1";  ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="7";  Preset="hevc_1080p_mp4";   Name="HD-Standard: 1080p H.265 CRF 20 in MP4 (smaller file)";
-        W=1920; H=1080; Container="mp4"; VCodec="hevc"; ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="8";  Preset="h264_1080p_mp4";   Name="HD-Legacy: 1080p H.264 CRF 18 in MP4 (high quality)";
-        W=1920; H=1080; Container="mp4"; VCodec="h264"; ACodec="aac";  PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="9";  Preset="prores_4k_mov";    Name="Archival-UHD: 4K ProRes 422 HQ + PCM in MOV (editing)";
-        W=3840; H=2160; Container="mov"; VCodec="prores"; ACodec="pcm"; PixFmt="yuv422p10le" },
-
-    [pscustomobject]@{ Key="10"; Preset="ffv1_4k_mkv";      Name="Archival-UHD: 4K FFV1 + FLAC in MKV (huge lossless master)";
-        W=3840; H=2160; Container="mkv"; VCodec="ffv1";  ACodec="flac"; PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="11"; Preset="prores_1080p_mov"; Name="Archival-HD: 1080p ProRes 422 HQ + PCM in MOV (editing)";
-        W=1920; H=1080; Container="mov"; VCodec="prores"; ACodec="pcm"; PixFmt="yuv422p10le" },
-
-    [pscustomobject]@{ Key="12"; Preset="ffv1_1080p_mkv";   Name="Archival-HD: 1080p FFV1 + FLAC in MKV (lossless master)";
-        W=1920; H=1080; Container="mkv"; VCodec="ffv1";  ACodec="flac"; PixFmt="yuv420p" },
-
-    [pscustomobject]@{ Key="13"; Preset="match_source";     Name="Match source (no resize), just rebuild (FFV1+FLAC MKV)";
-        W=$SrcInfo.Width; H=$SrcInfo.Height; Container="mkv"; VCodec="ffv1"; ACodec="flac"; PixFmt="yuv420p" }
-)
-
-
+# -------------------------
+# 7. Project discovery / resume
+# -------------------------
+function Select-ResumeProject {
+    param([Parameter(Mandatory)]$Projects)
 
     Write-Host ""
-    Write-Host "[Target Output Presets]"
-    foreach ($c in $choices) {
-        Write-Host ("  [{0}] {1}" -f $c.Key, $c.Name)
+    Write-Host "Detected unfinished projects:"
+    for ($i = 0; $i -lt $Projects.Count; $i++) {
+        $p = $Projects[$i]
+        Write-Host ("[{0}] {1} (gpu{2}, {3}%)" -f ($i + 1), $p.Name, $p.GpuIndex, $p.Percent)
     }
 
-    $sel  = Read-Host "Select 1-13"
-    $pick = $choices | Where-Object { $_.Key -eq $sel } | Select-Object -First 1
-    if (-not $pick) { throw "Invalid selection: $sel" }
+    $sel = Read-Host "Select project number to resume, or press Enter to start new"
+    if ([string]::IsNullOrWhiteSpace($sel)) { return $null }
 
-    if ($pick.Preset -eq "match_source") {
-        $preset = [pscustomobject]@{
-            Name      = "match_source"
-            Ext       = "mkv"
-            VCodec    = "ffv1"
-            VArgs     = @("-level","3","-g","1","-pix_fmt","yuv420p")
-            ACodec    = "flac"
-            AArgs     = @()
-            Scale     = $null
-            ExtraMaps = @()
-        }
-    } else {
-        $preset = Get-OutputPresetConfig -PresetName $pick.Preset
-        $preset.Scale = "$($pick.W):$($pick.H)"
+    if ($sel -notmatch '^\d+$') { throw "Invalid selection: $sel" }
+    $idx = [int]$sel - 1
+    if ($idx -lt 0 -or $idx -ge $Projects.Count) { throw "Selection out of range: $sel" }
 
-        if ($preset.Ext -ne $pick.Container) {
-            Write-Warning "Menu container '$($pick.Container)' != preset extension '$($preset.Ext)'. Using preset '$($preset.Ext)'."
-        }
-    }
-
-    # Return BOTH, so caller can update OutputPreset string + use preset object
-    return [pscustomobject]@{
-        Pick   = $pick
-        Preset = $preset
-    }
-}
-function Get-PngCount($dir) {
-    if (-not (Test-Path -LiteralPath $dir)) { return 0 }
-    return (Get-ChildItem -LiteralPath $dir -Filter "frame_*.png" -File -ErrorAction SilentlyContinue | Measure-Object).Count
+    return $Projects[$idx]
 }
 function Find-ExistingProjects([string]$Root = $BaseDir) {
     $projects = @()
@@ -2183,6 +1418,845 @@ function Find-ExistingProjects([string]$Root = $BaseDir) {
 
     return $projects
 }
+function Show-DryRunResume($jobName, $framesDir, $upscaledDir) {
+    $frameCount    = Get-PngCount $framesDir
+    $upscaledCount = Get-PngCount $upscaledDir
+
+    Write-Host ""
+    Write-Host "[DryRun] $jobName"
+
+    if ($frameCount -eq 0) {
+        Write-Host "  ERROR: No extracted frames"
+        return
+    }
+
+    $missing = $frameCount - $upscaledCount
+    $pct = [math]::Round(($upscaledCount / $frameCount) * 100, 2)
+
+    Write-Host "  Frames extracted : $frameCount"
+    Write-Host "  Frames upscaled  : $upscaledCount"
+    Write-Host "  Missing frames   : $missing"
+    Write-Host "  Completion       : $pct%"
+
+    if ($upscaledCount -eq $frameCount) {
+        Write-Host "  Action           : SKIP (already complete)"
+    }
+    elseif ($upscaledCount -lt $frameCount) {
+        Write-Host "  Action           : RESUME (upscale missing frames)"
+    }
+    else {
+        Write-Host "  Action           : ERROR (more upscaled than frames)"
+    }
+}
+# -------------------------
+# 8. Frame mapping
+# -------------------------
+function Get-FrameMap($dir) {
+    # Returns a HashSet-like dictionary of "frame_000001.png" -> $true
+    $map = @{}
+    if (-not (Test-Path $dir)) { return $map }
+    Get-ChildItem -Path $dir -Filter "frame_*.png" -File -ErrorAction SilentlyContinue | ForEach-Object {
+        $map[$_.Name] = $true
+    }
+    return $map
+}
+function Update-UpscaledFrames {
+    param(
+        [Parameter(Mandatory)][string]$framesDir,
+        [Parameter(Mandatory)][string]$upscaledDir,
+        [Parameter(Mandatory)][string]$todoDir,
+        [Parameter(Mandatory)][string]$UpscaylExe,
+        [Parameter(Mandatory)][string]$ModelName,
+        [Parameter(Mandatory)][int]$ScaleFactor,
+        [Parameter(Mandatory)][int]$GpuIdx,
+        [Parameter(Mandatory)][string]$GpuTagText,
+        [Parameter(Mandatory)][string]$VideoName
+    )
+
+    $frameFiles = Get-ChildItem -Path $framesDir -Filter "frame_*.png" -File -ErrorAction Stop
+    if (-not $frameFiles -or $frameFiles.Count -eq 0) { throw "No extracted frames found in $framesDir" }
+
+    $upMap = Get-FrameMap $upscaledDir
+
+    Remove-Item -Recurse -Force $todoDir -ErrorAction SilentlyContinue
+    New-Item -ItemType Directory -Force $todoDir | Out-Null
+
+    $missing = New-Object System.Collections.Generic.List[string]
+    foreach ($f in $frameFiles) {
+        if (-not $upMap.ContainsKey($f.Name)) {
+            $missing.Add($f.FullName)
+        }
+    }
+
+    if ($missing.Count -eq 0) {
+        Write-Host "[Resume] Upscaled set is complete -> no missing frames"
+        return
+    }
+
+    Write-Host "[Resume] Missing upscaled frames: $($missing.Count) -> upscaling ONLY missing frames"
+
+    foreach ($src in $missing) {
+        $leaf = Split-Path $src -Leaf
+        $dst  = Join-Path $todoDir $leaf
+        if ((Get-Item $src).PSDrive.Name -ne (Get-Item $todoDir).PSDrive.Name) {
+            Copy-Item $src $dst
+        } else {
+            New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
+        }
+    }
+
+    Write-Host "[Upscale Missing | $GpuTagText] $VideoName"
+    $gpuArgs = @()
+    if ($GpuIdx -ge 0) { $gpuArgs = @('-g', $GpuIdx) }
+
+            if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Upscayl) "models"))) {
+            throw "Upscayl models folder missing next to upscayl-bin.exe. Expected: $(Join-Path (Split-Path -Parent $Upscayl) 'models')"
+            }
+            & $Upscayl `
+    -i $frames `
+    -o $upscaled `
+    -n $Model `
+    -s $scaleForThis `
+    -m "..\models" `
+    @gpuArgs
+
+    if ($LASTEXITCODE -ne 0) { throw "Upscayl failed while processing missing frames for $VideoName" }
+}
+function Get-CounterSamples {
+    param([Parameter(Mandatory)][string]$Path)
+    try {
+        return (Get-Counter -Counter $Path -SampleInterval 1 -MaxSamples 1 -ErrorAction Stop).CounterSamples
+    } catch {
+        return @()  # counter missing or inaccessible
+    }
+}
+# -------------------------
+# 9. GPU probing + selection
+# -------------------------
+function Get-VideoControllers {
+    # Adapter names from Windows
+    Get-CimInstance Win32_VideoController |
+      Select-Object Name, AdapterCompatibility, VideoProcessor, PNPDeviceID, AdapterRAM
+}
+function Get-DiscreteVideoControllers {
+    $vc = Get-CimInstance Win32_VideoController | Select-Object Name, AdapterCompatibility, PNPDeviceID, AdapterRAM
+
+    # Filter out obvious non-GPU / useless adapters
+    $vc = $vc | Where-Object {
+        $_.Name -and
+        $_.Name -notmatch 'Basic Display|Microsoft Remote|DisplayLink|Virtual|VMware|Hyper-V|Citrix|BCM|Broadcom' -and
+        $_.AdapterCompatibility -notmatch 'Microsoft'
+    }
+
+    # Prefer AMD/NVIDIA and larger VRAM
+    $vc | Sort-Object @{
+        Expression = {
+            $score = 0
+            if ($_.AdapterCompatibility -match 'NVIDIA|AMD|Advanced Micro Devices') { $score += 100 }
+            if ($_.Name -match 'NVIDIA|GeForce|RTX|Quadro') { $score += 50 }
+            if ($_.Name -match 'AMD|Radeon') { $score += 50 }
+            $ramGB = 0
+            if ($_.AdapterRAM) { $ramGB = [math]::Round($_.AdapterRAM / 1GB, 0) }
+            $score += [int]$ramGB
+            $score
+        }
+        Descending = $true
+    }
+}
+function Get-ActiveGpuLuids {
+    param(
+        [double]$MinVramGB = 2.0,
+        [double]$MinUtilPercent = 5.0
+    )
+
+    $util = Get-GpuUtilizationByLuid
+    $mem  = Get-GpuDedicatedUsageByLuid
+
+    $luids = New-Object System.Collections.Generic.List[string]
+
+    foreach ($luid in (($util.Keys + $mem.Keys) | Sort-Object -Unique)) {
+        $useGB = if ($mem.ContainsKey($luid)) { $mem[$luid].UseGB } else { 0.0 }
+        $umax  = if ($util.ContainsKey($luid)) { $util[$luid].UtilMax } else { 0.0 }
+
+        if ($useGB -ge $MinVramGB -or $umax -ge $MinUtilPercent) {
+            $luids.Add($luid)
+        }
+    }
+    return $luids
+}
+function Get-LockedGpus {
+    $locked = @()
+    Get-ChildItem -Directory "_ffv1_work_gpu*" -ErrorAction SilentlyContinue | ForEach-Object {
+        if ($_.Name -match 'gpu(\d+)') {
+            # Non-empty directory = active or incomplete job
+            $hasFiles = Get-ChildItem $_.FullName -Recurse -File -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($hasFiles) {
+                $locked += [int]$Matches[1]
+            }
+        }
+    }
+    return $locked
+}
+function Get-GpuUtilizationByLuid {
+    # Returns: LUID -> @{ Util3D = x; UtilCompute = y; UtilMax = z }
+    try {
+        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
+    } catch {
+        return @{}
+    }
+
+    $out = @{}
+
+    foreach ($s in $c.CounterSamples) {
+        $inst = $s.InstanceName
+
+        # Extract LUID
+        if ($inst -notmatch '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') { continue }
+        $luid = $Matches[1]
+
+        # Identify engine type
+        $is3D      = ($inst -like '*engtype_3D*')
+        $isCompute = ($inst -like '*engtype_Compute*')
+
+        if (-not ($is3D -or $isCompute)) { continue }
+
+        if (-not $out.ContainsKey($luid)) {
+            $out[$luid] = [pscustomobject]@{ Util3D = 0.0; UtilCompute = 0.0; UtilMax = 0.0 }
+        }
+
+        $val = [double]$s.CookedValue
+
+        if ($is3D) {
+            # Use MAX (summing can exceed 100 with multiple engines)
+            $out[$luid].Util3D = [math]::Max($out[$luid].Util3D, $val)
+        }
+        if ($isCompute) {
+            $out[$luid].UtilCompute = [math]::Max($out[$luid].UtilCompute, $val)
+        }
+
+        $out[$luid].UtilMax = [math]::Max($out[$luid].UtilMax, $val)
+    }
+
+    return $out
+}
+function Get-Gpu3DUtilization {
+    try {
+        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
+    } catch {
+        return @{}
+    }
+
+    $util = @{}
+
+    $c.CounterSamples |
+        Where-Object { $_.InstanceName -like '*engtype_3D*' } |
+        ForEach-Object {
+            if ($_.InstanceName -match 'gpu_(\d+)_') {
+                $idx = [int]$Matches[1]
+                if (-not $util.ContainsKey($idx)) { $util[$idx] = 0 }
+                $util[$idx] = [math]::Max($util[$idx], [double]$_.CookedValue)
+            }
+        }
+
+    # Round for readability
+    foreach ($k in $util.Keys) {
+        $util[$k] = [math]::Round($util[$k], 1)
+    }
+
+    return $util
+}
+function Get-GpuDedicatedUsageByLuid {
+    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
+    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty
+
+    $limMap = @{}
+    foreach ($s in $limS) {
+        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
+            $limMap[$Matches[1]] = [double]$s.CookedValue
+        }
+    }
+
+    $out = @{}
+    foreach ($s in $useS) {
+        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
+            $luid = $Matches[1]
+            $useB = [double]$s.CookedValue
+            $limB = if ($limMap.ContainsKey($luid)) { [double]$limMap[$luid] } else { 0.0 }
+
+            $out[$luid] = [pscustomobject]@{
+                UseGB = [math]::Round($useB / 1GB, 2)
+                LimGB = [math]::Round($limB / 1GB, 2)
+                Pct   = if ($limB -gt 0) { [math]::Round(($useB / $limB) * 100, 1) } else { $null }
+            }
+        }
+    }
+    return $out
+}
+function Get-GpuMemoryByLuid {
+    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
+    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty
+
+    if (-not $useS -or $useS.Count -eq 0) { return @() }
+
+    $limMap = @{}
+    foreach ($s in $limS) {
+        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
+            $limMap[$Matches[1]] = [double]$s.CookedValue
+        }
+    }
+
+    $out = @()
+    foreach ($s in $useS) {
+        if ($s.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') {
+            $luid = $Matches[1]
+            $useB = [double]$s.CookedValue
+            $limB = if ($limMap.ContainsKey($luid)) { [double]$limMap[$luid] } else { 0.0 }
+
+            $out += [pscustomobject]@{
+                Luid = $luid
+                DedicatedUsageBytes = $useB
+                DedicatedLimitBytes = $limB
+            }
+        }
+    }
+
+    return $out
+}
+function Get-GpuDedicatedVramPercent {
+    <#
+      Returns a hashtable: gpuIndex -> dedicated VRAM percent used (0-100)
+      Uses Windows perf counters:
+        \GPU Adapter Memory(*)\Dedicated Usage
+        \GPU Adapter Memory(*)\Dedicated Limit   (may not exist!)
+    #>
+
+    $useS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Usage'
+    $limS = Get-CounterSamples '\GPU Adapter Memory(*)\Dedicated Limit'  # may be empty on some systems
+
+    if (-not $useS -or $useS.Count -eq 0) { return @{} }
+
+    # Map instance -> max usage/limit
+    $useMap = @{}
+    foreach ($s in $useS) { $useMap[$s.InstanceName] = [double]$s.CookedValue }
+
+    $limMap = @{}
+    foreach ($s in $limS) { $limMap[$s.InstanceName] = [double]$s.CookedValue }
+
+    # Aggregate by GPU index (gpu_#) across instances
+    $agg = @{}
+    foreach ($inst in $useMap.Keys) {
+        if ($inst -match 'gpu_(\d+)') {
+            $idx = [int]$Matches[1]
+            if (-not $agg.ContainsKey($idx)) { $agg[$idx] = [pscustomobject]@{ Use=0.0; Lim=0.0 } }
+
+            $agg[$idx].Use = [math]::Max($agg[$idx].Use, $useMap[$inst])
+            if ($limMap.ContainsKey($inst)) {
+                $agg[$idx].Lim = [math]::Max($agg[$idx].Lim, $limMap[$inst])
+            }
+        }
+    }
+
+    # Convert to percent (only where limit exists)
+    $out = @{}
+    foreach ($k in $agg.Keys) {
+        $useB = $agg[$k].Use
+        $limB = $agg[$k].Lim
+        if ($limB -gt 0) {
+            $out[$k] = [math]::Round(($useB / $limB) * 100, 1)
+        }
+    }
+
+    return $out
+}
+function Get-GpuEngine3DUtilByLuid {
+    # Returns objects keyed by LUID with summed 3D utilization (0-100)
+    # Counter instance name looks like:
+    # "pid_0x0_luid_0x00000000_0x0000..._phys_0_engtype_3D"
+    try {
+        $c = Get-CounterSamples '\GPU Engine(*)\Utilization Percentage' -SampleInterval 1 -MaxSamples 1
+    } catch {
+        return @()
+    }
+
+    $samples = $c.CounterSamples | Where-Object {
+        $_.InstanceName -like '*engtype_3D*'
+    }
+
+    $groups = $samples | Group-Object -Property {
+        if ($_.InstanceName -match '(luid_0x[0-9a-fA-F]+_0x[0-9a-fA-F]+)') { $Matches[1] } else { 'unknown' }
+    }
+
+    foreach ($g in $groups) {
+        [pscustomobject]@{
+            Luid = $g.Name
+            Util3D = [math]::Round( ($g.Group | Measure-Object -Property CookedValue -Sum).Sum, 2 )
+        }
+    }
+}
+function Show-GpuEngineSnapshot {
+    $util = Get-GpuEngine3DUtilByLuid
+    $mem  = Get-GpuMemoryByLuid
+
+    Write-Host "`n[GPU Engine 3D Utilization by LUID]"
+    if (-not $util -or $util.Count -eq 0) {
+        Write-Host "  (No GPU Engine counters available)"
+    } else {
+        $util | Sort-Object Util3D -Descending | ForEach-Object {
+            Write-Host ("  {0,-30}  {1,8} %" -f $_.Luid, $_.Util3D)
+        }
+    }
+
+    Write-Host "`n[GPU Dedicated Memory by LUID]"
+    if (-not $mem -or $mem.Count -eq 0) {
+        Write-Host "  (No GPU Adapter Memory counters available)"
+    } else {
+        $mem | Sort-Object DedicatedLimitBytes -Descending | ForEach-Object {
+            $uGB = [math]::Round($_.DedicatedUsageBytes / 1GB, 2)
+            $lGB = if ($_.DedicatedLimitBytes -gt 0) { [math]::Round($_.DedicatedLimitBytes / 1GB, 2) } else { $null }
+            Write-Host ("  {0,-30}  {1,7} GB / {2,7} GB" -f $_.Luid, $uGB, $lGB)
+        }
+    }
+}
+function Test-AnyGpuBusyOrLocked {
+    param(
+        [int]$BusyThresholdPercent = 50,
+        [int]$BusyVramGB = 18,
+        [double]$MinActiveVramGB = 2.0,
+        [double]$MinActiveUtilPercent = 5.0
+    )
+
+    $locked = Get-LockedGpus
+    if ($locked.Count -gt 0) {
+        Write-Warning ("Locked GPUs (work dirs present): {0}" -f ($locked -join ", "))
+    }
+
+    $util = Get-GpuUtilizationByLuid
+    $mem  = Get-GpuDedicatedUsageByLuid
+
+    # Only consider "real" adapters (filters out BCM / 0GB junk)
+    $activeLuids = Get-ActiveGpuLuids -MinVramGB $MinActiveVramGB -MinUtilPercent $MinActiveUtilPercent
+    if (-not $activeLuids -or $activeLuids.Count -eq 0) {
+        Write-Host "`n[GPU Busy Check] (No active GPU LUIDs detected from counters)"
+        return
+    }
+
+    Write-Host "`n[GPU Busy Check | by LUID]"
+
+    $warn = @()
+
+    foreach ($luid in ($activeLuids | Sort-Object)) {
+        $u3d  = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].Util3D, 2) } else { 0.0 }
+        $ucmp = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].UtilCompute, 2) } else { 0.0 }
+        $umax = if ($util.ContainsKey($luid)) { [math]::Round($util[$luid].UtilMax, 2) } else { 0.0 }
+
+        $useGB = if ($mem.ContainsKey($luid)) { $mem[$luid].UseGB } else { 0.0 }
+        $limGB = if ($mem.ContainsKey($luid)) { $mem[$luid].LimGB } else { 0.0 }
+        $pct   = if ($mem.ContainsKey($luid)) { $mem[$luid].Pct } else { $null }
+
+        $pctText = if ($null -ne $pct) { "$pct%" } else { "n/a" }
+
+        Write-Host ("  {0,-30}  3D={1,7}%  Compute={2,7}%  Max={3,7}%  VRAM={4,6}GB / {5,6}GB ({6})" -f `
+            $luid, $u3d, $ucmp, $umax, $useGB, $limGB, $pctText)
+
+        if ($umax -ge $BusyThresholdPercent) {
+            $warn += "LUID $luid utilization is high (MaxEng=$umax%)"
+        }
+
+        if ($null -ne $pct) {
+            if ($pct -ge $BusyThresholdPercent) { $warn += "LUID $luid VRAM is high ($pct%)" }
+        } else {
+            if ($useGB -ge $BusyVramGB) { $warn += "LUID $luid VRAM is high by usage ($useGB GB ≥ $BusyVramGB GB) (limit counter unavailable)" }
+        }
+    }
+
+    if ($warn.Count -gt 0) {
+        Write-Warning "One or more GPUs look busy:"
+        $warn | ForEach-Object { Write-Warning "  - $_" }
+
+        $resp = Read-Host "Continue anyway? (Y/N)"
+        if ($resp.Trim().ToUpper() -ne "Y") { throw "Aborted due to GPU busy warning" }
+    }
+}
+function Get-UpscaylGpuList {
+    param([Parameter(Mandatory)][string]$script:UpscaylExe)
+
+    $out = & $script:UpscaylExe -h 2>&1 | Out-String
+    if (-not $out) { $out = & $script:UpscaylExe 2>&1 | Out-String }
+
+    $gpus = @()
+
+    foreach ($line in ($out -split "`r?`n")) {
+        $t = $line.Trim()
+
+        # Accept formats like:
+        # [0 AMD Radeon ...]
+        # 0: AMD Radeon ...
+        # GPU 0 - AMD Radeon ...
+        if ($t -match '^\[(\d+)\s+(.+?)\]') {
+            $gpus += [pscustomobject]@{ Index=[int]$Matches[1]; Name=$Matches[2].Trim(); Raw=$t }
+            continue
+        }
+        if ($t -match '^(?:GPU\s*)?(\d+)\s*[:\-]\s*(.+)$') {
+            $gpus += [pscustomobject]@{ Index=[int]$Matches[1]; Name=$Matches[2].Trim(); Raw=$t }
+            continue
+        }
+    }
+
+    return $gpus
+}
+function Select-UpscaylGpuIndexAuto {
+    param(
+        [Parameter(Mandatory)][string]$script:UpscaylExe,
+        [switch]$PreferDiscrete
+    )
+
+    $up = Get-UpscaylGpuList -UpscaylPath $script:UpscaylExe
+    if (-not $up -or $up.Count -eq 0) {
+        Write-Warning "Couldn't parse Upscayl GPU list. Falling back to GPU 0."
+        return 0
+    }
+
+    $vc = Get-DiscreteVideoControllers
+
+    # Util + VRAM by LUID (Windows counters)
+    #$util = Get-GpuEngine3DUtilByLuid
+    #$mem  = Get-GpuMemoryByLuid
+
+    # Build a "discrete-ish" guess list from Windows adapters
+    # (AMD/NVIDIA typically discrete; Intel typically integrated)
+    $discreteNames = @()
+    if ($PreferDiscrete) {
+        $discreteNames = $vc | Where-Object {
+            $_.AdapterCompatibility -match 'AMD|Advanced Micro Devices|NVIDIA' -or $_.Name -match 'AMD|Radeon|NVIDIA|GeForce|RTX|GTX'
+        } | ForEach-Object { $_.Name }
+    }
+
+    # If we can’t map LUID -> Upscayl index perfectly, we do best-effort:
+    # - Prefer Upscayl device names that match a discrete adapter name
+    # - Use engine utilization totals as a tie-breaker if available (global low utilization)
+    # - Prefer higher Dedicated Limit (discrete tends to have large dedicated limit)
+    #
+    # We can’t directly map Upscayl index to LUID without extra DXGI plumbing,
+    # so we use a pragmatic approach:
+    #   choose the Upscayl GPU that matches a discrete name first.
+    $candidates = $up
+
+    if ($PreferDiscrete -and $discreteNames.Count -gt 0) {
+        $disc = @()
+        foreach ($g in $up) {
+            foreach ($n in $discreteNames) {
+                if ($g.Name -and $n -and ($g.Name -like "*$($n.Split(' ')[0])*" -or $n -like "*$($g.Name.Split(' ')[0])*" -or $g.Name -match 'Radeon|NVIDIA|GeForce|RTX|GTX')) {
+                    $disc += $g
+                    break
+                }
+            }
+        }
+        if ($disc.Count -gt 0) { $candidates = $disc }
+    }
+
+    # If we have memory counters, prefer the adapter with the largest dedicated limit
+    # (this usually corresponds to the discrete card). We can only use this as a heuristic:
+    $best = $candidates | Select-Object -First 1
+
+    # If multiple candidates, pick the one that "looks" best by name (XTX/XT/RTX etc.)
+    if ($candidates.Count -gt 1) {
+        $best = $candidates |
+          Sort-Object -Property @{
+              Expression = {
+                  # crude scoring by keywords
+                  $s = 0
+                  if ($_.Name -match 'XTX|XT|RTX|4090|4080|4070|7900|7800|7700|6950|6900') { $s += 10 }
+                  if ($_.Name -match 'Radeon|NVIDIA|GeForce') { $s += 5 }
+                  $s
+              }
+              Descending = $true
+          } | Select-Object -First 1
+    }
+
+    return $best.Index
+}
+# -------------------------
+# 10. Input enumeration
+# -------------------------
+function Get-InputVideoFiles {
+    param(
+        [Parameter(Mandatory)][string]$InputDir,
+        [string]$Extensions
+    )
+
+    # "*" means: scan all files and detect video by ffprobe
+    if ($Extensions -and $Extensions.Trim() -eq "*") {
+        return Get-ChildItem -Path $InputDir -File -ErrorAction SilentlyContinue |
+            Where-Object { Test-IsVideoFile $_.FullName } |
+            Sort-Object FullName -Unique
+    }
+
+    # extension-only scanning
+    $exts =
+        if ([string]::IsNullOrWhiteSpace($Extensions)) {
+            $VideoExtensions
+        } else {
+            $Extensions.Split(',') |
+                ForEach-Object { $_.Trim().TrimStart('.').ToLowerInvariant() } |
+                Where-Object { $_ }
+        }
+
+    return Get-ChildItem -Path $InputDir -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $ext = $_.Extension.TrimStart('.').ToLowerInvariant()
+            $exts -contains $ext
+        } |
+        Sort-Object FullName -Unique
+}
+
+
+# ==================
+# INIT SECTION (run once)
+# ==================
+
+# Resolve tools
+# Validate environment
+# Decide execution plan
+
+$PreferDiscrete = -not $NoPreferDiscrete
+
+$scriptRoot = if ($PSCommandPath) { Split-Path -Parent $PSCommandPath } else { (Get-Location).Path }
+$ToolsRoot  = Join-Path $scriptRoot "tools"
+
+# Now set the script variables you actually use
+$Upscayl = $upscaylPathResolved
+
+#Create Tools Folder and Check for Binaries and Models. Download if not available
+New-Item -ItemType Directory -Force $ToolsRoot | Out-Null
+
+$toolDirs = @()
+
+if ($ffmpegPath) { $toolDirs += (Split-Path -Path $ffmpegPath -Parent) }
+if ($upscaylPathResolved) { $toolDirs += (Split-Path -Path $upscaylPathResolved -Parent) }
+
+$toolDirs = $toolDirs | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+
+if ($toolDirs.Count -gt 0) {
+    $env:PATH = ($toolDirs -join ';') + ';' + $env:PATH
+}
+
+# Prefer system tools first
+$ffmpegPath  = Resolve-ExeOrNull "ffmpeg"
+$ffprobePath = Resolve-ExeOrNull "ffprobe"
+
+# Upscayl: either user provided a path, or try PATH
+$upscaylPathResolved = $null
+if ($PSBoundParameters.ContainsKey("UpscaylPath") -and (Test-Path -LiteralPath $UpscaylPath)) {
+    $upscaylPathResolved = (Resolve-Path -LiteralPath $UpscaylPath).Path
+} else {
+    $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin"
+    if (-not $upscaylPathResolved) { $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin.exe" }
+}
+
+$needDownload = (-not $ffmpegPath) -or (-not $ffprobePath) -or (-not $upscaylPathResolved)
+
+if ($needDownload) {
+    if (-not $AutoDownloadTools) {
+        throw ("Missing required tools. Install/provide them, or re-run with -AutoDownloadTools.`n" +
+               "ffmpeg  : {0}`nffprobe : {1}`nupscayl : {2}" -f $ffmpegPath, $ffprobePath, $upscaylPathResolved)
+    }
+
+    # Only now do your Get-FromGitHubReleaseZip calls
+    if ($AutoDownloadTools) {
+
+        # ---------------------------
+        # 1) FFmpeg + FFprobe from GyanD/codexffmpeg (*full_build.zip)
+        # ---------------------------
+        $ff = Get-FromGitHubReleaseZip `
+        -Owner "GyanD" `
+        -Repo "codexffmpeg" `
+        -AssetNameRegex 'ffmpeg-.*-full_build(-shared)?\.zip$' `
+        -InstallSubdir "ffmpeg" `
+        -PrimaryExeName "ffmpeg.exe" `
+        -SecondaryExeName "ffprobe.exe"
+
+        # ---------------------------
+        # 2) Upscayl (and whatever it bundles, potentially models) from upscayl/upscayl (*win.zip)
+        # ---------------------------
+        $up = Get-FromGitHubReleaseZip `
+        -Owner "upscayl" `
+        -Repo "upscayl" `
+        -AssetNameRegex '^upscayl-\d+\.\d+\.\d+-win\.zip$' `
+        -InstallSubdir "upscayl" `
+        -PrimaryExeName "upscayl-bin.exe"
+
+        # Override tool paths to downloaded versions
+        $ffmpegPath  = $ff.PrimaryExe
+        $ffprobePath = $ff.SecondaryExe
+        $UpscaylPath = $up.PrimaryExe
+        # Canonicalize: when we download, the resolved path is the downloaded one
+        $upscaylPathResolved = $up.PrimaryExe
+
+    } else {
+        Write-Host "[Tools] AutoDownloadTools not set; skipping downloads."
+    }
+
+    
+    # Add downloaded tool dirs to PATH for this process (guard nulls)
+    $toolDirs = @()
+
+    if ($ffmpegPath -and (Test-Path -LiteralPath $ffmpegPath)) {
+        $toolDirs += (Split-Path -Parent $ffmpegPath)
+    }
+    if ($upscaylPathResolved -and (Test-Path -LiteralPath $upscaylPathResolved)) {
+        $toolDirs += (Split-Path -Parent $upscaylPathResolved)
+    }
+
+    $toolDirs = $toolDirs | Where-Object { $_ } | Select-Object -Unique
+    if ($toolDirs.Count -gt 0) {
+        $env:PATH = (($toolDirs -join ';') + ';' + $env:PATH)
+    }
+
+    Write-Host "[Tools] Using downloaded tools:"
+    Write-Host "  ffmpeg : $ffmpegPath ($($ff.Source))"
+    Write-Host "  ffprobe: $ffprobePath ($($ff.Source))"
+    Write-Host "  upscayl: $upscaylPathResolved ($($up.Source))"
+} else {
+    Write-Host "[Tools] Using system tools from PATH:"
+    Write-Host "  ffmpeg : $ffmpegPath"
+    Write-Host "  ffprobe: $ffprobePath"
+    Write-Host "  upscayl: $upscaylPathResolved"
+    
+}
+
+# NOTE: validate *resolved paths*, not $script:* (those are set later)
+if ([string]::IsNullOrWhiteSpace($ffmpegPath)  -or -not (Test-Path -LiteralPath $ffmpegPath))  { throw "ffmpeg not found: '$ffmpegPath'" }
+if ([string]::IsNullOrWhiteSpace($ffprobePath) -or -not (Test-Path -LiteralPath $ffprobePath)) { throw "ffprobe not found: '$ffprobePath'" }
+if ([string]::IsNullOrWhiteSpace($upscaylPathResolved) -or -not (Test-Path -LiteralPath $upscaylPathResolved)) { throw "upscayl not found: '$upscaylPathResolved'" }
+
+$ffDir = Split-Path -Parent $ffmpegPath
+$upDir = Split-Path -Parent $upscaylPathResolved
+$env:PATH = "$ffDir;$upDir;$env:PATH"
+
+# ---- Canonicalize tooling vars (single source of truth) ----
+$script:FfmpegExe  = $ffmpegPath
+$script:FfprobeExe = $ffprobePath
+$script:UpscaylExe = $upscaylPathResolved
+
+# If user explicitly provided -UpscaylPath, honor it (but fall back to downloaded if not found)
+if ($PSBoundParameters.ContainsKey('UpscaylPath')) {
+    try {
+        $resolvedUserUpscayl = Resolve-FullPath $script:UpscaylExe
+        if (Test-Path -LiteralPath $resolvedUserUpscayl) {
+            $script:UpscaylExe = $resolvedUserUpscayl
+        } else {
+            Write-Warning "User-specified UpscaylPath not found; using downloaded upscayl: $script:UpscaylExe"
+        }
+    } catch {
+        Write-Warning "Could not resolve user UpscaylPath; using downloaded upscayl: $script:UpscaylExe"
+    }
+}
+
+$ffDir = if ($script:FfmpegExe)  { Split-Path -Parent $script:FfmpegExe }  else { $null }
+$upDir = if ($script:UpscaylExe) { Split-Path -Parent $script:UpscaylExe } else { $null }
+
+if ($ffDir -and $upDir) {
+    $env:PATH = "$ffDir;$upDir;$env:PATH"
+}
+
+if ([string]::IsNullOrWhiteSpace($script:FfmpegExe)  -or -not (Test-Path -LiteralPath $script:FfmpegExe))  {
+    throw "ffmpeg not found/resolved: '$script:FfmpegExe'"
+}
+if ([string]::IsNullOrWhiteSpace($script:FfprobeExe) -or -not (Test-Path -LiteralPath $script:FfprobeExe)) {
+    throw "ffprobe not found/resolved: '$script:FfprobeExe'"
+}
+if ([string]::IsNullOrWhiteSpace($script:UpscaylExe) -or -not (Test-Path -LiteralPath $script:UpscaylExe)) {
+    throw "upscayl not found/resolved: '$script:UpscaylExe'"
+}
+
+# Add tool dirs to PATH (nice-to-have)
+$ffDir = Split-Path -Parent $script:FfmpegExe
+$upDir = Split-Path -Parent $script:UpscaylExe
+$env:PATH = "$ffDir;$upDir;$env:PATH"
+
+
+# -------------------------
+# SCRIPT BODY (main logic)
+# -------------------------
+
+# Ask to Try a Dry Run
+if (-not $PSBoundParameters.ContainsKey("DryRun")) {
+    $DryRun = (Read-Host "Dry-run resume check only? (Y/N)").ToUpper() -eq "Y"
+}
+
+# InputDir: default "source" already; resolve relative
+$InputDirFull = Join-Path $BaseDir $InputDir
+if (-not (Test-Path $InputDirFull)) { throw "Source directory not found: $InputDirFull" }
+$InputDirFull = (Resolve-Path $InputDirFull).Path
+
+# ---- Interactive fallback ONLY if not provided explicitly ----
+
+if (-not $PSBoundParameters.ContainsKey("InputDir")) {
+    $raw = Read-Host "Enter source directory (default: source)"
+    if (-not [string]::IsNullOrWhiteSpace($raw)) {
+        $InputDir = $raw
+        $InputDirFull = (Resolve-Path (Join-Path $BaseDir $InputDir)).Path
+    }
+}
+
+$GpuTag = if ($GpuIndex -ge 0) { "gpu$GpuIndex" } else { "gpuNA" }
+
+
+# ---------------- GPU SELECTION (after functions exist) ----------------
+
+# Only pick GPU if we actually need it for work.
+# For pure -DryRun, we can skip GPU logic entirely.
+if (-not $DryRun) {
+
+    if ($GpuIndex -lt 0) {
+        $gpuInput = Read-Host "GPU index for Upscayl (Enter = auto)"
+        if ([string]::IsNullOrWhiteSpace($gpuInput)) {
+            $GpuIndex = -1   # auto
+        } else {
+            if ($gpuInput -notmatch '^\d+$') { throw "GPU index must be numeric" }
+            $GpuIndex = [int]$gpuInput
+        }
+
+    }
+
+    # -1 means "Upscayl auto" and is allowed.
+
+    Test-AnyGpuBusyOrLocked -BusyThresholdPercent $BusyThresholdPercent
+}
+
+# ---------------- END GPU SELECTION ----------------
+
+$GpuTag = if ($GpuIndex -ge 0) { "gpu$GpuIndex" } else { "gpuAuto" }
+
+# Compute WorkDir/OutputDir if not provided
+if ([string]::IsNullOrWhiteSpace($WorkDir)) {
+    $WorkDir = Join-Path $BaseDir "_ffv1_work_$GpuTag"
+} else {
+    $WorkDir = Join-Path $BaseDir $WorkDir
+}
+if ([string]::IsNullOrWhiteSpace($OutputDir)) {
+    switch ($OutputPreset) {
+        "h264_4k_mp4"     { $OutputDir = Join-Path $BaseDir "h264_4k_$GpuTag" }
+        "hevc_4k_mp4"     { $OutputDir = Join-Path $BaseDir "hevc_4k_$GpuTag" }
+        "prores_4k_mov"   { $OutputDir = Join-Path $BaseDir "prores_4k_$GpuTag" }
+        "av1_4k_mkv"      { $OutputDir = Join-Path $BaseDir "av1_4k_$GpuTag" }
+        "av1_4k_mp4"      { $OutputDir = Join-Path $BaseDir "av1_4k_$GpuTag" }
+        "ffv1_1080p_mkv" { $OutputDir = Join-Path $BaseDir "ffv1_1080p_$GpuTag" }
+        "ffv1_4k_mkv"    { $OutputDir = Join-Path $BaseDir "ffv1_4k_$GpuTag" }
+        "av1_1080p_mkv"  { $OutputDir = Join-Path $BaseDir "av1_1080p_$GpuTag" }
+        "av1_1080p_mp4"  { $OutputDir = Join-Path $BaseDir "av1_1080p_$GpuTag" }
+        default          { $OutputDir = Join-Path $BaseDir "output_$OutputPreset`_$GpuTag" }
+    }
+} else {
+    $OutputDir = Join-Path $BaseDir $OutputDir
+}
+
+New-Item -ItemType Directory -Force $WorkDir   | Out-Null
+New-Item -ItemType Directory -Force $OutputDir | Out-Null
+
+# Replace your old $InputDir usage with $InputDirFull going forward
+$InputDir = $InputDirFull
+$Upscayl = $script:UpscaylExe
 
 
 # ---------------- DECISION: DryRun / Resume selection ----------------
@@ -2202,27 +2276,6 @@ if ($DryRun) {
     }
     Write-Host "`n[DryRun] No actions performed."
     exit 0
-}
-
-# Helper: prompt user to pick a project index (only when needed)
-function Select-ResumeProject {
-    param([Parameter(Mandatory)]$Projects)
-
-    Write-Host ""
-    Write-Host "Detected unfinished projects:"
-    for ($i = 0; $i -lt $Projects.Count; $i++) {
-        $p = $Projects[$i]
-        Write-Host ("[{0}] {1} (gpu{2}, {3}%)" -f ($i + 1), $p.Name, $p.GpuIndex, $p.Percent)
-    }
-
-    $sel = Read-Host "Select project number to resume, or press Enter to start new"
-    if ([string]::IsNullOrWhiteSpace($sel)) { return $null }
-
-    if ($sel -notmatch '^\d+$') { throw "Invalid selection: $sel" }
-    $idx = [int]$sel - 1
-    if ($idx -lt 0 -or $idx -ge $Projects.Count) { throw "Selection out of range: $sel" }
-
-    return $Projects[$idx]
 }
 
 # If user asked to resume, pick a job (prompt only if needed)
@@ -2298,119 +2351,6 @@ if ($Resume -and $GpuIndex -ge 0) {
 }
 
 # ---------------- END DECISION BLOCK ----------------
-
-
-function Get-VideoControllers {
-    # Adapter names from Windows
-    Get-CimInstance Win32_VideoController |
-      Select-Object Name, AdapterCompatibility, VideoProcessor, PNPDeviceID, AdapterRAM
-}
-
-function Show-DryRunResume($jobName, $framesDir, $upscaledDir) {
-    $frameCount    = Get-PngCount $framesDir
-    $upscaledCount = Get-PngCount $upscaledDir
-
-    Write-Host ""
-    Write-Host "[DryRun] $jobName"
-
-    if ($frameCount -eq 0) {
-        Write-Host "  ERROR: No extracted frames"
-        return
-    }
-
-    $missing = $frameCount - $upscaledCount
-    $pct = [math]::Round(($upscaledCount / $frameCount) * 100, 2)
-
-    Write-Host "  Frames extracted : $frameCount"
-    Write-Host "  Frames upscaled  : $upscaledCount"
-    Write-Host "  Missing frames   : $missing"
-    Write-Host "  Completion       : $pct%"
-
-    if ($upscaledCount -eq $frameCount) {
-        Write-Host "  Action           : SKIP (already complete)"
-    }
-    elseif ($upscaledCount -lt $frameCount) {
-        Write-Host "  Action           : RESUME (upscale missing frames)"
-    }
-    else {
-        Write-Host "  Action           : ERROR (more upscaled than frames)"
-    }
-}
-
-
-function Get-Fps($file) {
-    $r = & $script:FfprobeExe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nw=1 "file:$file"
-    $r = $r -replace "r_frame_rate=", ""
-    if (-not $r) { return 30.0 }
-    if ($r -match "/") {
-        $p = $r.Split("/")
-        if ($p.Count -eq 2 -and [double]$p[1] -ne 0) { return [double]$p[0] / [double]$p[1] }
-    }
-    return [double]$r
-}
-function Get-FrameMap($dir) {
-    # Returns a HashSet-like dictionary of "frame_000001.png" -> $true
-    $map = @{}
-    if (-not (Test-Path $dir)) { return $map }
-    Get-ChildItem -Path $dir -Filter "frame_*.png" -File -ErrorAction SilentlyContinue | ForEach-Object {
-        $map[$_.Name] = $true
-    }
-    return $map
-}
-
-function Update-UpscaledFrames {
-    param(
-        [Parameter(Mandatory)][string]$framesDir,
-        [Parameter(Mandatory)][string]$upscaledDir,
-        [Parameter(Mandatory)][string]$todoDir,
-        [Parameter(Mandatory)][string]$UpscaylExe,
-        [Parameter(Mandatory)][string]$ModelName,
-        [Parameter(Mandatory)][int]$ScaleFactor,
-        [Parameter(Mandatory)][int]$GpuIdx,
-        [Parameter(Mandatory)][string]$GpuTagText,
-        [Parameter(Mandatory)][string]$VideoName
-    )
-
-    $frameFiles = Get-ChildItem -Path $framesDir -Filter "frame_*.png" -File -ErrorAction Stop
-    if (-not $frameFiles -or $frameFiles.Count -eq 0) { throw "No extracted frames found in $framesDir" }
-
-    $upMap = Get-FrameMap $upscaledDir
-
-    Remove-Item -Recurse -Force $todoDir -ErrorAction SilentlyContinue
-    New-Item -ItemType Directory -Force $todoDir | Out-Null
-
-    $missing = New-Object System.Collections.Generic.List[string]
-    foreach ($f in $frameFiles) {
-        if (-not $upMap.ContainsKey($f.Name)) {
-            $missing.Add($f.FullName)
-        }
-    }
-
-    if ($missing.Count -eq 0) {
-        Write-Host "[Resume] Upscaled set is complete -> no missing frames"
-        return
-    }
-
-    Write-Host "[Resume] Missing upscaled frames: $($missing.Count) -> upscaling ONLY missing frames"
-
-    foreach ($src in $missing) {
-        $leaf = Split-Path $src -Leaf
-        $dst  = Join-Path $todoDir $leaf
-        if ((Get-Item $src).PSDrive.Name -ne (Get-Item $todoDir).PSDrive.Name) {
-            Copy-Item $src $dst
-        } else {
-            New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
-        }
-    }
-
-    Write-Host "[Upscale Missing | $GpuTagText] $VideoName"
-    $gpuArgs = @()
-    if ($GpuIdx -ge 0) { $gpuArgs = @('-g', $GpuIdx) }
-
-    & $UpscaylExe -i $todoDir -o $upscaledDir -n $ModelName -s $ScaleFactor @gpuArgs
-
-    if ($LASTEXITCODE -ne 0) { throw "Upscayl failed while processing missing frames for $VideoName" }
-}
 
 
 # ---------------- MAIN LOOP ----------------
@@ -2580,9 +2520,18 @@ foreach ($file in $inputFiles) {
         Remove-Item "$upscaled\*.png" -Force -ErrorAction SilentlyContinue
         $gpuArgs = @()
         if ($GpuIndex -ge 0) { $gpuArgs = @('-g', $GpuIndex) }  # only when user picked
-        & $Upscayl -i $frames -o $upscaled -n $Model -s $scaleForThis @gpuArgs
-        if ($LASTEXITCODE -ne 0) { throw "Upscayl failed: $($file.Name)" }
+            if (-not (Test-Path -LiteralPath (Join-Path (Split-Path -Parent $Upscayl) "models"))) {
+            throw "Upscayl models folder missing next to upscayl-bin.exe. Expected: $(Join-Path (Split-Path -Parent $Upscayl) 'models')"
+            }
+            & $Upscayl `
+    -i $frames `
+    -o $upscaled `
+    -n $Model `
+    -s $scaleForThis `
+    -m "..\models" `
+    @gpuArgs
 
+        if ($LASTEXITCODE -ne 0) { throw "Upscayl failed: $($file.Name)" }
         $upscaledCount2 = Get-PngCount $upscaled
         if ($upscaledCount2 -ne $frameCount) {
             throw "Upscaled set incomplete after full run ($upscaledCount2/$frameCount) for $($file.Name)"
@@ -2654,7 +2603,6 @@ foreach ($file in $inputFiles) {
         Write-Warning "Output failed validation; keeping temp files: $jobDir"
         throw "Invalid output: $outFile"
     }
-
 
     Write-Host "[OK] Created: $(Split-Path $outFile -Leaf)"
 
