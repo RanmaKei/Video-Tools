@@ -124,7 +124,7 @@ param(
     [string]$InputDir = "source",
 
     [Parameter()]
-    [string]$script:UpscaylExe = ".\upscayl-bin.exe",
+    [string]$UpscaylPath = "",
 
     # Upscayl options
     [Parameter()]
@@ -432,7 +432,6 @@ function Resolve-VideoTools {
 
         [switch]$AutoDownloadTools,
 
-        # optional: folder where your script downloads tools
         [string]$ToolsDir = (Join-Path $PSScriptRoot "tools")
     )
 
@@ -440,18 +439,40 @@ function Resolve-VideoTools {
         param(
             [Parameter(Mandatory)][string]$Name,
             [string]$PreferredPath,
-            [string]$CommandName
+            [string]$CommandName,
+            [string[]]$ScriptDirCandidates = @(),
+            [switch]$WasExplicitlyProvided
         )
 
+        # 1) If user explicitly provided a path: validate or throw
         # 1) Explicit path wins (if supplied)
         if (-not [string]::IsNullOrWhiteSpace($PreferredPath)) {
-            if (Test-Path -LiteralPath $PreferredPath) {
-                return (Resolve-Path -LiteralPath $PreferredPath).Path
+
+            # If relative, make it relative to the script folder (NOT the current working dir)
+            $p = $PreferredPath
+            if (-not [IO.Path]::IsPathRooted($p)) {
+                $p = Join-Path $PSScriptRoot $p
             }
-            throw "$Name path was provided but not found: $PreferredPath"
+
+            if (Test-Path -LiteralPath $p) {
+                return (Resolve-Path -LiteralPath $p).Path
+            }
+
+            # If AutoDownloadTools is enabled, don't hard-fail yet.
+            if ($AutoDownloadTools) { return $null }
+
+            throw "$Name path was provided but not found: $PreferredPath (resolved to '$p')"
         }
 
-        # 2) PATH
+        # 2) Try script-folder candidates (only when not explicitly provided)
+        foreach ($cand in $ScriptDirCandidates) {
+            $p = Join-Path $PSScriptRoot $cand
+            if (Test-Path -LiteralPath $p) {
+                return (Resolve-Path -LiteralPath $p).Path
+            }
+        }
+
+        # 3) Try PATH
         $cmd = Get-Command $CommandName -ErrorAction SilentlyContinue
         if ($cmd -and $cmd.Source) { return $cmd.Source }
 
@@ -459,37 +480,41 @@ function Resolve-VideoTools {
     }
 
     $resolved = [ordered]@{
-        ffmpeg  = _ResolveOne -Name "ffmpeg"  -PreferredPath $FfmpegExe  -CommandName "ffmpeg"
-        ffprobe = _ResolveOne -Name "ffprobe" -PreferredPath $FfprobeExe -CommandName "ffprobe"
-        upscayl = _ResolveOne -Name "upscayl" -PreferredPath $UpscaylExe -CommandName "upscayl"
+        ffmpeg  = _ResolveOne -Name "ffmpeg"  -PreferredPath $FfmpegExe  -CommandName "ffmpeg"  -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfmpegExe')
+        ffprobe = _ResolveOne -Name "ffprobe" -PreferredPath $FfprobeExe -CommandName "ffprobe" -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('FfprobeExe')
+        upscayl = _ResolveOne -Name "upscayl" -PreferredPath $UpscaylExe -CommandName "upscayl-bin.exe" `
+                    -ScriptDirCandidates @("upscayl-bin.exe","upscayl.exe","upscayl-bin") `
+                    -WasExplicitlyProvided:$PSBoundParameters.ContainsKey('UpscaylExe')
     }
 
-    # If you want: optionally attempt downloads ONLY if enabled and something missing
     if ($AutoDownloadTools) {
         foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
             if (-not $resolved[$k]) {
-                # Call your existing download logic here (keep it in ONE place)
-                # $resolved[$k] = Get-DownloadedToolPath -Name $k -ToolsDir $ToolsDir
+                # hook your downloader here
             }
         }
     }
 
-    # Final validation (fail fast, clean error)
+    if ($AutoDownloadTools) {
+        Ensure-VideoToolsDownloaded -ToolsDir $ToolsDir   # <— your download function
+        $resolved = Resolve-VideoTools -FfmpegExe $FfmpegExe -FfprobeExe $FfprobeExe -UpscaylExe $UpscaylExe -AutoDownloadTools:$AutoDownloadTools
+    }
+
+    # Final validation after download attempt
     foreach ($k in @("ffmpeg","ffprobe","upscayl")) {
         if (-not $resolved[$k]) {
-            throw "[Tools] Missing required tool: $k. Provide -${k}Exe or add it to PATH (or enable -AutoDownloadTools)."
+            throw "[Tools] Still missing required tool after download attempt: $k"
         }
     }
+        $script:Tools = [pscustomobject]@{
+            Ffmpeg  = $resolved.ffmpeg
+            Ffprobe = $resolved.ffprobe
+            Upscayl = $resolved.upscayl
+        }
 
-    # Export as one canonical script state
-    $script:Tools = [pscustomobject]@{
-        Ffmpeg  = $resolved.ffmpeg
-        Ffprobe = $resolved.ffprobe
-        Upscayl = $resolved.upscayl
+        return $script:Tools
     }
 
-    return $script:Tools
-}
 
 function Get-InputVideoFiles {
     param(
@@ -521,12 +546,6 @@ function Get-InputVideoFiles {
         } |
         Sort-Object FullName -Unique
 }
-
-$null = Resolve-VideoTools `
-    -FfmpegExe  $FfmpegExe `
-    -FfprobeExe $FfprobeExe `
-    -UpscaylExe $UpscaylExe `
-    -AutoDownloadTools:$AutoDownloadTools
 
 $BaseDir = (Get-Location).Path
 
@@ -581,6 +600,32 @@ function Find-ExeInDir {
         if ($r) { return $r }
     }
     return $null
+}
+
+function Resolve-UpscaylExe {
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][string]$RootDir
+    )
+
+    if (-not (Test-Path -LiteralPath $RootDir)) { return $null }
+
+    # Upscayl zips vary; find anything that looks like the main exe.
+    $candidates = Get-ChildItem -LiteralPath $RootDir -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.Extension -ieq ".exe" -and
+            $_.Name -imatch '^upscayl.*\.exe$' -and
+            $_.Name -inotmatch 'unins|uninstall'
+        }
+
+    if (-not $candidates) { return $null }
+
+    # Prefer your older naming if it exists
+    $preferred = $candidates | Where-Object { $_.Name -ieq "upscayl-bin.exe" } | Select-Object -First 1
+    if ($preferred) { return $preferred.FullName }
+
+    # Otherwise pick the shortest path (usually the real app exe, not buried junk)
+    return ($candidates | Sort-Object @{Expression={ $_.FullName.Length }} | Select-Object -First 1).FullName
 }
 
 function Resolve-ExeFromPath {
@@ -646,84 +691,15 @@ function Resolve-ExeOrNull {
     if ($cmd -and $cmd.Source) { return $cmd.Source }
     return $null
 }
-
-# Prefer system tools first
-$ffmpegPath  = Resolve-ExeOrNull "ffmpeg"
-$ffprobePath = Resolve-ExeOrNull "ffprobe"
-
-# Upscayl: either user provided a path, or try PATH
-$upscaylPathResolved = $null
-if ($PSBoundParameters.ContainsKey("UpscaylPath") -and (Test-Path -LiteralPath $UpscaylPath)) {
-    $upscaylPathResolved = (Resolve-Path -LiteralPath $UpscaylPath).Path
-} else {
-    $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin"
-    if (-not $upscaylPathResolved) { $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin.exe" }
+function Find-FirstFile {
+    param(
+        [Parameter(Mandatory)][string]$Root,
+        [Parameter(Mandatory)][string]$FileName
+    )
+    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
+        Where-Object { $_.Name -ieq $FileName } |
+        Select-Object -First 1 -ExpandProperty FullName
 }
-
-$needDownload = (-not $ffmpegPath) -or (-not $ffprobePath) -or (-not $upscaylPathResolved)
-
-if ($needDownload) {
-    if (-not $AutoDownloadTools) {
-        throw ("Missing required tools. Install/provide them, or re-run with -AutoDownloadTools.`n" +
-               "ffmpeg  : {0}`nffprobe : {1}`nupscayl : {2}" -f $ffmpegPath, $ffprobePath, $upscaylPathResolved)
-    }
-
-    # Only now do your Get-FromGitHubReleaseZip calls
-    if ($AutoDownloadTools) {
-
-        # ---------------------------
-        # 1) FFmpeg + FFprobe from GyanD/codexffmpeg (*full_build.zip)
-        # ---------------------------
-        $ff = Get-FromGitHubReleaseZip `
-        -Owner "GyanD" `
-        -Repo "codexffmpeg" `
-        -AssetNameRegex 'ffmpeg-.*-full_build(-shared)?\.zip$' `
-        -InstallSubdir "ffmpeg" `
-        -PrimaryExeName "ffmpeg.exe" `
-        -SecondaryExeName "ffprobe.exe"
-
-        # ---------------------------
-        # 2) Upscayl (and whatever it bundles, potentially models) from upscayl/upscayl (*win.zip)
-        # ---------------------------
-        $up = Get-FromGitHubReleaseZip `
-        -Owner "upscayl" `
-        -Repo "upscayl" `
-        -AssetNameRegex '^upscayl-\d+\.\d+\.\d+-win\.zip$' `
-        -InstallSubdir "upscayl" `
-        -PrimaryExeName "upscayl-bin.exe"
-
-        # Override tool paths to downloaded versions
-        $ffmpegPath  = $ff.PrimaryExe
-        $ffprobePath = $ff.SecondaryExe
-        $UpscaylPath = $up.PrimaryExe
-
-    } else {
-        Write-Host "[Tools] AutoDownloadTools not set; skipping downloads."
-    }
-
-    # Add downloaded tool dirs to PATH for this process
-    $env:PATH = ((Split-Path $ffmpegPath -Parent) + ";" + (Split-Path $upscaylPathResolved -Parent) + ";" + $env:PATH)
-
-    Write-Host "[Tools] Using downloaded tools:"
-    Write-Host "  ffmpeg : $ffmpegPath ($($ff.Source))"
-    Write-Host "  ffprobe: $ffprobePath ($($ff.Source))"
-    Write-Host "  upscayl: $upscaylPathResolved ($($up.Source))"
-} else {
-    Write-Host "[Tools] Using system tools from PATH:"
-    Write-Host "  ffmpeg : $ffmpegPath"
-    Write-Host "  ffprobe: $ffprobePath"
-    Write-Host "  upscayl: $upscaylPathResolved"
-    
-    # IMPORTANT: set the canonical vars the rest of the script uses
-    $script:FfmpegExe  = $ffmpegPath
-    $script:FfprobeExe = $ffprobePath
-    $script:UpscaylExe = $upscaylPathResolved
-}
-
-# Now set the script variables you actually use
-$Upscayl = $upscaylPathResolved
-
-
 function Get-GitHubReleaseAsset {
     param(
         [Parameter(Mandatory)][string]$Owner,
@@ -787,16 +763,221 @@ function Expand-ZipFresh {
     New-Item -ItemType Directory -Force $DestDir | Out-Null
     Expand-Archive -LiteralPath $ZipPath -DestinationPath $DestDir -Force
 }
-
-function Find-FirstFile {
+function Get-FromGitHubReleaseZip {
     param(
-        [Parameter(Mandatory)][string]$Root,
-        [Parameter(Mandatory)][string]$FileName
+        [Parameter(Mandatory)][string]$Owner,
+        [Parameter(Mandatory)][string]$Repo,
+        [Parameter(Mandatory)][string]$AssetNameRegex,
+        [Parameter(Mandatory)][string]$InstallSubdir,
+        [Parameter(Mandatory)][string]$PrimaryExeName,
+        [string]$SecondaryExeName = ""
     )
-    Get-ChildItem -LiteralPath $Root -Recurse -File -ErrorAction SilentlyContinue |
-        Where-Object { $_.Name -ieq $FileName } |
-        Select-Object -First 1 -ExpandProperty FullName
+
+    $installDir = Join-Path $ToolsRoot $InstallSubdir
+    
+    # Already installed?
+    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
+    if ($installedPrimary) {
+        $installedSecondary = $null
+        if ($SecondaryExeName) {
+            $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
+        }
+
+        return [pscustomobject]@{
+            InstallDir   = $installDir
+            PrimaryExe   = $installedPrimary
+            SecondaryExe = $installedSecondary
+            Source       = "cache"
+        }
+    }
+
+    $asset = Get-GitHubReleaseAsset -Owner $Owner -Repo $Repo -NameRegex $AssetNameRegex
+    Write-Host "[Tools] Downloading $Owner/$Repo $($asset.Tag) asset: $($asset.Name)"
+
+    $cacheDir = Join-Path $ToolsRoot "_cache"
+    New-Item -ItemType Directory -Force $cacheDir | Out-Null
+    $zipPath  = Join-Path $cacheDir $asset.Name
+
+    Invoke-DownloadFile -Url $asset.DownloadUrl -OutFile $zipPath
+
+    # Extract to temp then copy the folder that contains the exe(s)
+    $tmp = Join-Path $cacheDir ("extract_{0}_{1}" -f $InstallSubdir, ([guid]::NewGuid().ToString("N")))
+    Expand-ZipFresh -ZipPath $zipPath -DestDir $tmp
+
+    # After Expand-Archive of Upscayl into $upscaylRoot (or whatever your dest folder is)
+    $upscaylPathResolved = Resolve-UpscaylExe -RootDir $upscaylRoot
+
+    if (-not $upscaylPathResolved) {
+        $dump = Get-ChildItem -LiteralPath $upscaylRoot -Recurse -File -ErrorAction SilentlyContinue |
+            Select-Object -First 30 -ExpandProperty FullName
+        throw "Upscayl extracted but no upscayl*.exe found under: $upscaylRoot`nTop files:`n$($dump -join "`n")"
+    }
+
+    $foundPrimary = Find-FirstFile -Root $tmp -FileName $PrimaryExeName
+    if (-not $foundPrimary) {
+        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName inside it."
+    }
+
+    $srcDir = Split-Path $foundPrimary -Parent
+
+    # If we also need a secondary exe (ffprobe), ensure it’s in same folder or nearby
+    if ($SecondaryExeName) {
+        $foundSecondary = Find-FirstFile -Root $tmp -FileName $SecondaryExeName
+        if (-not $foundSecondary) {
+            throw "Downloaded $asset.Name but couldn't find $SecondaryExeName inside it."
+        }
+        $srcDir2 = Split-Path $foundSecondary -Parent
+        if ($srcDir2 -ne $srcDir) {
+            # If they are in different folders, copy both folder trees into installDir (simplest safe approach)
+            # We'll just copy from the common root to preserve needed DLLs/resources.
+            $srcDir = $tmp
+        }
+    }
+
+    # Install: copy the whole folder contents (keeps DLLs/models/etc)
+    if (Test-Path -LiteralPath $installDir) {
+        Remove-Item -LiteralPath $installDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    New-Item -ItemType Directory -Force $installDir | Out-Null
+    Get-ChildItem -LiteralPath $srcDir -Force -ErrorAction Stop |
+    Copy-Item -Destination $installDir -Recurse -Force -ErrorAction Stop
+
+
+    # Re-locate exe(s) inside install dir (in case they are in nested bin\)
+    $installedPrimary = Find-FirstFile -Root $installDir -FileName $PrimaryExeName
+    if (-not $installedPrimary) { throw "Install succeeded but $PrimaryExeName not found under $installDir" }
+
+    $installedSecondary = $null
+    if ($SecondaryExeName) {
+        $installedSecondary = Find-FirstFile -Root $installDir -FileName $SecondaryExeName
+        if (-not $installedSecondary) { throw "Install succeeded but $SecondaryExeName not found under $installDir" }
+    }
+
+    # Cleanup temp extract
+    Remove-Item -LiteralPath $tmp -Recurse -Force -ErrorAction SilentlyContinue
+
+    return [pscustomobject]@{
+        InstallDir   = $installDir
+        PrimaryExe   = $installedPrimary
+        SecondaryExe = $installedSecondary
+        Source      = "${Owner}/${Repo}:$($asset.Tag)"
+    }
 }
+
+
+$toolDirs = @()
+
+if ($ffmpegPath) { $toolDirs += (Split-Path -Path $ffmpegPath -Parent) }
+if ($upscaylPathResolved) { $toolDirs += (Split-Path -Path $upscaylPathResolved -Parent) }
+
+$toolDirs = $toolDirs | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -Unique
+
+if ($toolDirs.Count -gt 0) {
+    $env:PATH = ($toolDirs -join ';') + ';' + $env:PATH
+}
+
+
+# Prefer system tools first
+$ffmpegPath  = Resolve-ExeOrNull "ffmpeg"
+$ffprobePath = Resolve-ExeOrNull "ffprobe"
+
+# Upscayl: either user provided a path, or try PATH
+$upscaylPathResolved = $null
+if ($PSBoundParameters.ContainsKey("UpscaylPath") -and (Test-Path -LiteralPath $UpscaylPath)) {
+    $upscaylPathResolved = (Resolve-Path -LiteralPath $UpscaylPath).Path
+} else {
+    $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin"
+    if (-not $upscaylPathResolved) { $upscaylPathResolved = Resolve-ExeOrNull "upscayl-bin.exe" }
+}
+
+$needDownload = (-not $ffmpegPath) -or (-not $ffprobePath) -or (-not $upscaylPathResolved)
+
+if ($needDownload) {
+    if (-not $AutoDownloadTools) {
+        throw ("Missing required tools. Install/provide them, or re-run with -AutoDownloadTools.`n" +
+               "ffmpeg  : {0}`nffprobe : {1}`nupscayl : {2}" -f $ffmpegPath, $ffprobePath, $upscaylPathResolved)
+    }
+
+    # Only now do your Get-FromGitHubReleaseZip calls
+    if ($AutoDownloadTools) {
+
+        # ---------------------------
+        # 1) FFmpeg + FFprobe from GyanD/codexffmpeg (*full_build.zip)
+        # ---------------------------
+        $ff = Get-FromGitHubReleaseZip `
+        -Owner "GyanD" `
+        -Repo "codexffmpeg" `
+        -AssetNameRegex 'ffmpeg-.*-full_build(-shared)?\.zip$' `
+        -InstallSubdir "ffmpeg" `
+        -PrimaryExeName "ffmpeg.exe" `
+        -SecondaryExeName "ffprobe.exe"
+
+        # ---------------------------
+        # 2) Upscayl (and whatever it bundles, potentially models) from upscayl/upscayl (*win.zip)
+        # ---------------------------
+        $up = Get-FromGitHubReleaseZip `
+        -Owner "upscayl" `
+        -Repo "upscayl" `
+        -AssetNameRegex '^upscayl-\d+\.\d+\.\d+-win\.zip$' `
+        -InstallSubdir "upscayl" `
+        -PrimaryExeName "upscayl-bin.exe"
+
+        # Override tool paths to downloaded versions
+        $ffmpegPath  = $ff.PrimaryExe
+        $ffprobePath = $ff.SecondaryExe
+        $UpscaylPath = $up.PrimaryExe
+        # Canonicalize: when we download, the resolved path is the downloaded one
+        $upscaylPathResolved = $up.PrimaryExe
+
+        # IMPORTANT: set the canonical vars the rest of the script uses
+        $script:FfmpegExe  = $ffmpegPath
+        $script:FfprobeExe = $ffprobePath
+        $script:UpscaylExe = $upscaylPathResolved
+
+
+    } else {
+        Write-Host "[Tools] AutoDownloadTools not set; skipping downloads."
+    }
+
+    
+    # Add downloaded tool dirs to PATH for this process (guard nulls)
+    $toolDirs = @()
+
+    if ($ffmpegPath -and (Test-Path -LiteralPath $ffmpegPath)) {
+        $toolDirs += (Split-Path -Parent $ffmpegPath)
+    }
+    if ($upscaylPathResolved -and (Test-Path -LiteralPath $upscaylPathResolved)) {
+        $toolDirs += (Split-Path -Parent $upscaylPathResolved)
+    }
+
+    $toolDirs = $toolDirs | Where-Object { $_ } | Select-Object -Unique
+    if ($toolDirs.Count -gt 0) {
+        $env:PATH = (($toolDirs -join ';') + ';' + $env:PATH)
+    }
+
+
+    Write-Host "[Tools] Using downloaded tools:"
+    Write-Host "  ffmpeg : $ffmpegPath ($($ff.Source))"
+    Write-Host "  ffprobe: $ffprobePath ($($ff.Source))"
+    Write-Host "  upscayl: $upscaylPathResolved ($($up.Source))"
+} else {
+    Write-Host "[Tools] Using system tools from PATH:"
+    Write-Host "  ffmpeg : $ffmpegPath"
+    Write-Host "  ffprobe: $ffprobePath"
+    Write-Host "  upscayl: $upscaylPathResolved"
+    
+    # IMPORTANT: set the canonical vars the rest of the script uses
+    $script:FfmpegExe  = $ffmpegPath
+    $script:FfprobeExe = $ffprobePath
+    $script:UpscaylExe = $upscaylPathResolved
+}
+
+# Now set the script variables you actually use
+$Upscayl = $upscaylPathResolved
+
+
+
+
 
 function Get-FromGitHubReleaseZip {
     param(
@@ -840,9 +1021,16 @@ function Get-FromGitHubReleaseZip {
     Expand-ZipFresh -ZipPath $zipPath -DestDir $tmp
 
     $foundPrimary = Find-FirstFile -Root $tmp -FileName $PrimaryExeName
-    if (-not $foundPrimary) {
-        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName inside it."
+
+    # Upscayl releases may not ship "upscayl-bin.exe"; fall back to discovery
+    if (-not $foundPrimary -and $Repo -eq "upscayl") {
+        $foundPrimary = Resolve-UpscaylExe -RootDir $tmp
     }
+
+    if (-not $foundPrimary) {
+        throw "Downloaded $asset.Name but couldn't find $PrimaryExeName inside it (or any upscayl*.exe)."
+    }
+
 
     $srcDir = Split-Path $foundPrimary -Parent
 
@@ -2100,13 +2288,24 @@ function Get-FrameMap($dir) {
     return $map
 }
 
-function Update-UpscaledFrames($framesDir, $upscaledDir, $todoDir, $UpscaylExe, $ModelName, $ScaleFactor, $GpuIdx, $GpuTagText, $VideoName) {
+function Update-UpscaledFrames {
+    param(
+        [Parameter(Mandatory)][string]$framesDir,
+        [Parameter(Mandatory)][string]$upscaledDir,
+        [Parameter(Mandatory)][string]$todoDir,
+        [Parameter(Mandatory)][string]$UpscaylExe,
+        [Parameter(Mandatory)][string]$ModelName,
+        [Parameter(Mandatory)][int]$ScaleFactor,
+        [Parameter(Mandatory)][int]$GpuIdx,
+        [Parameter(Mandatory)][string]$GpuTagText,
+        [Parameter(Mandatory)][string]$VideoName
+    )
+
     $frameFiles = Get-ChildItem -Path $framesDir -Filter "frame_*.png" -File -ErrorAction Stop
     if (-not $frameFiles -or $frameFiles.Count -eq 0) { throw "No extracted frames found in $framesDir" }
 
     $upMap = Get-FrameMap $upscaledDir
 
-    # Build todo dir
     Remove-Item -Recurse -Force $todoDir -ErrorAction SilentlyContinue
     New-Item -ItemType Directory -Force $todoDir | Out-Null
 
@@ -2124,7 +2323,6 @@ function Update-UpscaledFrames($framesDir, $upscaledDir, $todoDir, $UpscaylExe, 
 
     Write-Host "[Resume] Missing upscaled frames: $($missing.Count) -> upscaling ONLY missing frames"
 
-    # Create hardlinks for missing frames into todo folder (fast, no duplicate data)
     foreach ($src in $missing) {
         $leaf = Split-Path $src -Leaf
         $dst  = Join-Path $todoDir $leaf
@@ -2133,15 +2331,13 @@ function Update-UpscaledFrames($framesDir, $upscaledDir, $todoDir, $UpscaylExe, 
         } else {
             New-Item -ItemType HardLink -Path $dst -Target $src | Out-Null
         }
-
     }
 
-    # Run Upscayl on todo folder; output directly into upscaled folder
     Write-Host "[Upscale Missing | $GpuTagText] $VideoName"
     $gpuArgs = @()
     if ($GpuIdx -ge 0) { $gpuArgs = @('-g', $GpuIdx) }
 
-    & $UpscaylExe -i $todoDir -o $upscaledDir -n $ModelName -ScaleFactor $scaleForThis @gpuArgs
+    & $UpscaylExe -i $todoDir -o $upscaledDir -n $ModelName -s $ScaleFactor @gpuArgs
 
     if ($LASTEXITCODE -ne 0) { throw "Upscayl failed while processing missing frames for $VideoName" }
 }
@@ -2177,7 +2373,15 @@ if (-not $preset) {
     $preset = Get-OutputPresetConfig -PresetName $OutputPreset
 }
 
-$targetForSummary = Get-TargetWHFromPreset -Preset $preset -SrcInfo (Get-VideoInfo -Path ($inputFiles | Select-Object -First 1).FullName)
+$first = $inputFiles | Select-Object -First 1
+if ($null -eq $first -or [string]::IsNullOrWhiteSpace($first.FullName)) {
+    Write-Warning "No input files found; cannot detect source geometry for preset summary."
+    $targetForSummary = $null
+} else {
+    $srcInfoForSummary = Get-VideoInfo -Path $first.FullName
+    $targetForSummary  = Get-TargetWHFromPreset -Preset $preset -SrcInfo $srcInfoForSummary
+}
+
 
 Write-Host ("Output    : {0} ({1}x{2})  v={3}  a={4}  pixfmt={5}" -f `
     $preset.Ext, `

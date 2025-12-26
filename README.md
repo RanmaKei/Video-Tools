@@ -1,47 +1,18 @@
-# 🎞️ Video Upscale Pipeline (Upscayl + FFmpeg)
+# Video-Upscale.ps1
 
-A **GPU-aware, resumable, lossless-first video upscaling pipeline** built around  
-**Upscayl (Real-ESRGAN)** and **FFmpeg**.
-
-Designed for **long-running jobs**, **multi-GPU systems**, and **failure-safe recovery** 
+A **GPU-aware video upscaling pipeline** built on **Upscayl + FFmpeg**, designed for long-running jobs, interrupted resumes, and archival-quality outputs.
 
 ---
 
 ## ✨ Features
 
-- ✅ Batch processing of videos from a source folder
-- ✅ GPU selection (manual or automatic)
-- ✅ GPU-tagged work/output folders (`gpu0`, `gpu1`) to avoid collisions
-- ✅ Smart resume
-  - Keeps extracted frames
-  - Only upscales missing frames if interrupted
-- ✅ Dry-run mode to inspect incomplete jobs
-- ✅ Output validation before cleanup
-- ✅ Optional temp retention (`-NoDelete`)
-- ✅ Multiple output presets (lossless masters or delivery formats)
-- ✅ Safe overwrite control (`-Force`)
-- ✅ Audio automatically restored from source
-- ✅ **Size-first delivery defaults** (AV1 / HEVC) while keeping **lossless masters** available
-
----
-
-## 📁 Folder Structure
-
-```
-.
-├── models
-├── source/
-│   └── video1.webm
-├── _ffv1_work_gpu0/
-│   └── video1/
-│       ├── frames/
-│       ├── upscaled/
-│       └── _todo_missing/
-├── ffv1_1080p_gpu0/
-│   └── video1_ffv1_1080p_gpu0.mkv
-├── Video-Upscale.ps1
-└── README.md
-```
+### Core Pipeline
+1. **Extract frames** from source video (FFmpeg)
+2. **Upscale frames** with Upscayl (Real-ESRGAN family)
+3. **Normalize geometry** only if needed (optional FFmpeg step)
+4. **Rebuild final video** with chosen codec/container
+5. **Validate output**
+6. **Clean up safely** (or keep temps)
 
 ---
 
@@ -55,31 +26,67 @@ Designed for **long-running jobs**, **multi-GPU systems**, and **failure-safe re
 
 ---
 
-## 🚀 Quick Start
+## 🔁 Smart Resume
 
+- Detects incomplete jobs automatically
+- Only processes missing frames
+- Safe to resume after crash or reboot
+
+---
+
+## 📋 Requirements
+
+### External Tools
+- `ffmpeg`
+- `ffprobe`
+- `upscayl-bin.exe`
+
+If not installed system-wide, enable:
 ```powershell
-.\Video-Upscale.ps1
+-AutoDownloadTools
 ```
 
-### Recommended defaults (best size / modern delivery)
-If you want **best file size by default**, set your script default preset to **AV1**:
+---
 
+## 🚀 Usage
+
+### Basic Run
 ```powershell
-# in param(...)
-[string]$OutputPreset = "av1_1080p_mkv"
+pwsh .\Video-Upscale.ps1
 ```
 
-If you need more compatibility (older TVs / devices), default to **HEVC** instead:
+---
 
+### Resume an Interrupted Job
 ```powershell
-[string]$OutputPreset = "hevc_1080p_mp4"
+pwsh .\Video-Upscale.ps1 -Resume
 ```
 
-### Lossless master workflow (recommended archival)
-Run a lossless master first, then create delivery encodes later:
+---
 
+### Dry-Run (No Work Performed)
 ```powershell
-.\Video-Upscale.ps1 -OutputPreset ffv1_1080p_mkv
+pwsh .\Video-Upscale.ps1 -DryRun
+```
+
+---
+
+### Keep Temporary Files
+```powershell
+pwsh .\Video-Upscale.ps1 -NoDelete
+```
+
+---
+
+## 📁 Directory Layout
+
+```
+Video-Tools/
+├─ Video-Upscale.ps1
+├─ source/
+├─ tools/
+├─ _ffv1_work_gpu0/
+└─ output_av1_1080p_gpu0/
 ```
 
 ---
@@ -113,14 +120,6 @@ Run a lossless master first, then create delivery encodes later:
 
 ---
 
-## 🔁 Smart Resume
-
-- Detects incomplete jobs automatically
-- Only processes missing frames
-- Safe to resume after crash or reboot
-
----
-
 ## 🧪 Validation & Safety
 
 - Output verified via `ffprobe`
@@ -134,3 +133,4 @@ Run a lossless master first, then create delivery encodes later:
 - FFmpeg: https://ffmpeg.org/  
 - Upscayl: https://github.com/upscayl/upscayl  
 - Real-ESRGAN: https://github.com/xinntao/Real-ESRGAN  
+
